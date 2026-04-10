@@ -1,0 +1,75 @@
+groups:
+  - name: network_health_pipeline
+    rules:
+      # DLQ rate > 5% of total ingested records — data quality degradation
+      - alert: HighDLQRate
+        expr: |
+          rate(dlq_records_total[5m])
+          / (rate(records_validated_total[5m]) + 1) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High DLQ rate detected"
+          description: >
+            DLQ rate is {{ $value | humanizePercentage }} of total ingested records
+            (threshold: 5%). Check quarantine reasons in the data quality dashboard.
+
+      # No records ingested from any topic for 5 minutes — pipeline stall
+      - alert: NoPipelineIngestion
+        expr: rate(records_ingested_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pipeline ingestion has stopped"
+          description: >
+            No records ingested in the last 5 minutes on source={{ $labels.source }},
+            topic={{ $labels.topic }}. Check consumer health and Kafka connectivity.
+
+      # Kafka consumer lag > 10,000 records — pipeline falling behind
+      - alert: KafkaConsumerLagHigh
+        expr: kafka_consumer_lag > 10000
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag is high"
+          description: >
+            Consumer lag on topic={{ $labels.topic }}, partition={{ $labels.partition }}
+            is {{ $value }} records (threshold: 10,000).
+
+      # Flatline anomaly detected — operational emergency
+      - alert: FlatlineDetected
+        expr: increase(flatline_events_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Flatline anomaly detected on site {{ $labels.site_id }}"
+          description: >
+            A flatline event (zero variance over 4h sliding window) was detected
+            on site_id={{ $labels.site_id }}. This indicates a stuck interface
+            or metric reporting failure.
+
+      # Site health score below degraded threshold
+      - alert: SiteHealthDegraded
+        expr: site_health_score < 40
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Site {{ $labels.site_id }} health is degraded"
+          description: >
+            Site health score for site_id={{ $labels.site_id }} is {{ $value }}
+            (threshold: 40). Check the anomaly dashboard for details.
+
+      # Batch model candidate rejected — retraining quality issue
+      - alert: ModelRetrainingRejected
+        expr: increase(model_retrain_rejected_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Anomaly model retraining candidate was rejected"
+          description: >
+            A new Isolation Forest candidate was rejected because it underperformed
+            the current production model. Human review of recent Silver data recommended.

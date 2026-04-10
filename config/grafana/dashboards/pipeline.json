@@ -1,0 +1,76 @@
+{
+  "title": "Pipeline Dashboard",
+  "uid": "pipeline",
+  "version": 1,
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "time": { "from": "now-3h", "to": "now" },
+  "tags": ["network-health", "pipeline"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Records Ingested / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(records_ingested_total[1m])",
+          "legendFormat": "{{source}} / {{topic}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "DLQ Rate (% of ingested)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(dlq_records_total[1m]) / (rate(records_validated_total[1m]) + 1) * 100",
+          "legendFormat": "DLQ %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 3 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Kafka Consumer Lag",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "kafka_consumer_lag",
+          "legendFormat": "{{topic}} / partition {{partition}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Pipeline Latency per Stage (p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(pipeline_latency_seconds_bucket[5m]))",
+          "legendFormat": "p99 {{stage}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    }
+  ]
+}
