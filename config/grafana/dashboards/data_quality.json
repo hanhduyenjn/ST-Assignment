@@ -1,0 +1,66 @@
+{
+  "title": "Data Quality Dashboard",
+  "uid": "data-quality",
+  "version": 1,
+  "schemaVersion": 38,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "tags": ["network-health", "data-quality"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "DLQ Breakdown by Reason",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (reason) (increase(dlq_records_total[24h]))",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Orphan Rate (ORPHANED_DEVICE as % of DLQ)",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "increase(dlq_records_total{reason=\"ORPHANED_DEVICE\"}[24h]) / (increase(dlq_records_total[24h]) + 1) * 100",
+          "legendFormat": "Orphan %"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "id": 3,
+      "title": "Ingest vs Batch Anomaly Agreement Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "datasource": { "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT toStartOfHour(validated_at) AS time, countIf(agreement = 'CONFIRMED') / count() * 100 AS agreement_pct FROM network_health.anomaly_validation GROUP BY time ORDER BY time",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "id": 4,
+      "title": "DLQ Reprocessing Success Rate",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT countIf(quarantine_resolution = 'PROMOTED_TO_SILVER') / countIf(reprocessed = 1) * 100 AS reprocess_success_pct FROM network_health.silver_dlq_quarantine",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    }
+  ]
+}

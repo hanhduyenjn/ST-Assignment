@@ -1,0 +1,41 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+rule_files:
+  - /etc/prometheus/alerting_rules.yml
+
+scrape_configs:
+  # Pipeline application — custom Prometheus metrics from monitoring/exporter.py
+  - job_name: network_health_app
+    static_configs:
+      - targets: ["app:8000"]
+    metrics_path: /metrics
+
+  # Prometheus self-monitoring
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Kafka JMX metrics (via JMX exporter sidecar if added later)
+  # Uncomment when kafka-jmx-exporter sidecar is wired up
+  # - job_name: kafka
+  #   static_configs:
+  #     - targets: ["kafka:7071"]
+
+  # Spark master metrics
+  - job_name: spark_master
+    static_configs:
+      - targets: ["spark-master:8080"]
+    metrics_path: /metrics/master/prometheus
+
+  # ClickHouse metrics
+  - job_name: clickhouse
+    static_configs:
+      - targets: ["clickhouse:9363"]
+    metrics_path: /metrics

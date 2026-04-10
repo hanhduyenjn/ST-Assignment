@@ -1,0 +1,89 @@
+{
+  "title": "Anomaly Dashboard",
+  "uid": "anomaly",
+  "version": 1,
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "tags": ["network-health", "anomaly"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Site Health Score (latest)",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "site_health_score",
+          "legendFormat": "{{site_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 40 },
+              { "color": "green", "value": 70 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Flatline Events per Site",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "increase(flatline_events_total[5m])",
+          "legendFormat": "{{site_id}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Model Anomaly Flags by Subtype",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "increase(model_anomaly_flags_total[5m])",
+          "legendFormat": "{{subtype}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Anomaly Flags — Recent (ClickHouse)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT device_id, site_id, interface_name, anomaly_type, anomaly_subtype, score, detected_at FROM network_health.gold_anomaly_flags ORDER BY detected_at DESC LIMIT 50",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Site Health Score Heatmap (hourly, last 24h)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "datasource": { "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT site_id, window_start, health_score, is_degraded FROM network_health.gold_site_health_hourly WHERE window_start >= now() - INTERVAL 24 HOUR ORDER BY site_id, window_start",
+          "format": "table"
+        }
+      ]
+    }
+  ]
+}

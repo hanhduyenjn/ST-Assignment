@@ -1153,7 +1153,7 @@ state.
 
 | Topic | Partitions | Retention | Key | Notes |
 |---|---|---|---|---|
-| `raw.interface-stats` | 6 | 7 days | `device_id` | Keyed to preserve per-device order |
+| `raw.interface.stats` | 6 | 7 days | `device_id` | Keyed to preserve per-device order |
 | `raw.syslogs` | 6 | 7 days | `device_id` | |
 | `raw.inventory` | 1 | Forever | `device_id` | Compacted — always latest device state |
 | `output.anomaly-alerts` | 3 | 7 days | `site_id` | Prometheus consumer group |
