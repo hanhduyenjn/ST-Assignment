@@ -11,6 +11,15 @@ KAFKA_TOPIC_SYSLOGS = "raw.syslogs"
 KAFKA_TOPIC_INVENTORY = "raw.inventory"
 KAFKA_TOPIC_ANOMALY_ALERTS = "output.anomaly-alerts"
 
+CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "clickhouse")
+CLICKHOUSE_PORT = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
+CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "default")
+CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "")
+CLICKHOUSE_DB = os.environ.get("CLICKHOUSE_DB", "network_health")
+
+DUCKDB_PATH = os.environ.get("DUCKDB_PATH", ":memory:")
+METRICS_PORT = int(os.environ.get("METRICS_PORT", "9108"))
+
 ICEBERG_REST_URL = os.environ.get("ICEBERG_REST_CATALOG_URL", "http://iceberg-rest:8181")
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")
 MINIO_ACCESS_KEY = os.environ.get("MINIO_ROOT_USER", "minioadmin")
