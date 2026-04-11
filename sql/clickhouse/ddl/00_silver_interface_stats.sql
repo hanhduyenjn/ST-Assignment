@@ -11,7 +11,7 @@
 
 CREATE TABLE IF NOT EXISTS network_health.silver_interface_stats_src
 ENGINE = Iceberg(
-    'http://minio:9000/lakehouse/warehouse/silver/interface_stats/',
+    'http://minio:9000/lakehouse/silver/interface_stats/',
     'minioadmin',
     'minioadmin123'
 );
