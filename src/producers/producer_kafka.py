@@ -8,11 +8,11 @@ import traceback
 from kafka import KafkaProducer
 
 from src.common.config import (
+    DATA_DIR,
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_TOPIC_INTERFACE_STATS,
-    KAFKA_TOPIC_SYSLOGS,
     KAFKA_TOPIC_INVENTORY,
-    DATA_DIR,
+    KAFKA_TOPIC_SYSLOGS,
 )
 
 ENCODING_FORMAT = "utf-8"

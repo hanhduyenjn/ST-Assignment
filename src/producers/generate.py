@@ -1,12 +1,11 @@
+import csv
 import json
 import random
-import csv
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
 from typing import Optional
 
 from src.common.config import DATA_DIR
-
 
 VENDORS = ["Cisco", "Arista", "Fortinet", "Juniper", "Palo Alto"]
 ROLES = ["router", "switch", "firewall", "access-point", "load-balancer"]

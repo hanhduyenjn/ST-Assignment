@@ -1,4 +1,5 @@
-device_id,site_id,vendor,roledev-532,SITE-B,Fortinet,switch
+device_id,site_id,vendor,role
+dev-532,SITE-B,Fortinet,switch
 dev-523,SITE-B,Cisco,firewall
 dev-103,DC1,Palo Alto,router
 dev-195,SITE-B,Cisco,switch

@@ -149,6 +149,7 @@ SPARK BATCH (nightly scheduled)
 | ML — batch | scikit-learn IsolationForest | Unsupervised; no labels needed; joblib/ONNX export |
 | ML — distillation | scikit-learn DecisionTreeClassifier | Distills forest into streaming rules |
 | ML — retraining gate | Held-out validation window | Candidate model only promoted if it outperforms current; prevents contaminated retraining |
+| Batch job scheduler | Apache Airflow | Cron-based DAG orchestration for bronze ingest, DLQ reprocessor, model train/detect, PSI drift; UI for monitoring and manual triggers |
 | Feature store (future) | ScyllaDB | Device behavioral embeddings; low-latency streaming lookup |
 | Container | Docker Compose | On-premises, no Kubernetes required for PoC |
 
@@ -195,10 +196,12 @@ Stage 2 — Enrich (in-memory, no Kafka hop)
 
 ### 4.2 Bronze Ingest Path (Spark batch, replaces Kafka Connect)
 
+Scheduled by Airflow DAG `bronze_ingest_dag` (every 15 minutes, `SparkSubmitOperator`).
+
 ```
 Kafka raw topics
     │ Spark reads via read (batch, offset-based)
-    │ Scheduled every 15 minutes (or triggered)
+    │ Triggered by Airflow every 15 minutes
     ▼
 BronzeIngestJob
     │ No transformation — raw payload preserved exactly
@@ -208,12 +211,14 @@ BronzeIngestJob
 Iceberg bronze/ tables (append-only, permanent retention)
 ```
 
-### 4.3 Batch Path (nightly, post-processing)
+### 4.3 Batch Path (nightly / weekly, orchestrated by Airflow)
+
+All jobs triggered by Airflow DAGs using `SparkSubmitOperator` or `BashOperator`.
 
 ```
 silver/interface_stats (Iceberg, last 30 days)
     │
-    ├──▶ IsolationForestDetector.train()  [weekly]
+    ├──▶ IsolationForestDetector.train()  [weekly — Airflow DAG: weekly_batch_dag]
     │        compute feature vectors (10 features per device+interface window)
     │        fit IsolationForest(n_estimators=100, contamination=0.05)
     │        distill → DecisionTreeClassifier(max_depth=4) → streaming rules
@@ -881,6 +886,17 @@ ensures Iceberg scans only relevant files — no full table scan.
 - Fixable records: re-run ValidatorChain → write to silver → mark `reprocessed=true`, `resolution=PROMOTED_TO_SILVER`
 - Permanent records: mark `reprocessed=true`, `resolution=PERMANENT`
 
+**Airflow DAGs (`dags/`):**
+
+| DAG | Schedule | Jobs triggered |
+|---|---|---|
+| `bronze_ingest_dag` | `*/15 * * * *` (every 15 min) | `pipeline/bronze_ingest.py` via `SparkSubmitOperator` |
+| `nightly_batch_dag` | `0 2 * * *` (02:00 daily) | DLQ reprocessor → IsolationForest detect (sequential) |
+| `weekly_batch_dag` | `0 3 * * 0` (03:00 Sunday) | IsolationForest train → PSI drift detector (sequential) |
+| `backfill_dag` | Manual trigger only | `pipeline/batch.py` with configurable `site_id` + date range |
+
+Each DAG uses `SparkSubmitOperator` pointing at `spark://spark-master:7077`. Jobs are sequential within a DAG (later tasks depend on earlier ones). The Airflow scheduler and webserver run as separate containers sharing the `./dags` directory (mounted read-only).
+
 ---
 
 ### 8.5 Storage Layer
@@ -1283,6 +1299,10 @@ is_degraded = health_score < 40
 | `alertmanager` | `prom/alertmanager` | Alert routing |
 | `spark-master` | `bitnami/spark` | Spark master |
 | `spark-worker` | `bitnami/spark` | Spark worker(s) |
+| `postgres` | `postgres:16` | Airflow metadata DB (LocalExecutor backend) |
+| `airflow-init` | `apache/airflow:2.9.1` | One-shot: DB migration + admin user creation |
+| `airflow-scheduler` | `apache/airflow:2.9.1` | Parses DAGs, triggers runs on schedule |
+| `airflow-webserver` | `apache/airflow:2.9.1` | UI on port 8085; DAG monitoring + manual triggers |
 
 All services on a single Docker network `network-health-net`.
 MinIO bucket `lakehouse` created on startup via `mc` init container.
@@ -1334,6 +1354,10 @@ ClickHouse DDL applied on startup via init SQL files mounted at `/docker-entrypo
 | `pipeline/bronze_ingest.py` | Spark batch: Kafka → bronze Iceberg | storage/iceberg_writer, catalog |
 | `pipeline/batch.py` | SparkSQL backfill, window fns | storage, catalog |
 | `pipeline/dlq_reprocessor.py` | DLQ classify → promote → mark | validators, storage |
+| `dags/bronze_ingest_dag.py` | Airflow DAG: 15-min bronze ingest schedule | SparkSubmitOperator |
+| `dags/nightly_batch_dag.py` | Airflow DAG: nightly DLQ + IF detect | SparkSubmitOperator |
+| `dags/weekly_batch_dag.py` | Airflow DAG: weekly IF train + PSI drift | SparkSubmitOperator |
+| `dags/backfill_dag.py` | Airflow DAG: manual backfill trigger | SparkSubmitOperator, Params |
 | `storage/base.py` | StorageWriter ABC | nothing |
 | `storage/iceberg_writer.py` | All Iceberg table writes | base, catalog |
 | `storage/clickhouse_writer.py` | ClickHouse inserts | config |
@@ -1383,24 +1407,29 @@ Write code in this exact sequence. Each layer depends only on layers above it.
 25. pipeline/batch.py                 # backfill + SparkSQL window fns
 26. pipeline/dlq_reprocessor.py       # DLQ reprocessing
 
-27. query/duckdb_engine.py
-28. query/fastapi_bridge.py
+27. dags/bronze_ingest_dag.py         # Airflow: every-15-min bronze ingest
+28. dags/nightly_batch_dag.py         # Airflow: nightly DLQ + IF detect
+29. dags/weekly_batch_dag.py          # Airflow: weekly IF train + PSI drift
+30. dags/backfill_dag.py              # Airflow: manual backfill trigger
 
-29. monitoring/metrics.py
-30. monitoring/exporter.py
+31. query/duckdb_engine.py
+32. query/fastapi_bridge.py
 
-31. sql/iceberg/ddl/*.sql             # table definitions
-32. sql/clickhouse/ddl/*.sql          # Gold table DDL
-33. sql/clickhouse/views/*.sql        # materialized views
+33. monitoring/metrics.py
+34. monitoring/exporter.py
 
-34. config/prometheus.yml
-35. config/alerting_rules.yml
-36. config/grafana/datasources/*.yml
-37. config/grafana/dashboards/*.json
+35. sql/iceberg/ddl/*.sql             # table definitions
+36. sql/clickhouse/ddl/*.sql          # Gold table DDL
+37. sql/clickhouse/views/*.sql        # materialized views
 
-38. docker-compose.yml                # wire everything together
-39. main.py                           # CLI entrypoint
-40. README.md                         # ADR
+38. config/prometheus.yml
+39. config/alerting_rules.yml
+40. config/grafana/datasources/*.yml
+41. config/grafana/dashboards/*.json
+
+42. docker-compose.yml                # wire everything together
+43. main.py                           # CLI entrypoint
+44. README.md                         # ADR
 ```
 
 ---
