@@ -6,7 +6,7 @@
 
 CREATE TABLE IF NOT EXISTS network_health.silver_syslogs_src
 ENGINE = Iceberg(
-    'http://minio:9000/lakehouse/warehouse/silver/syslogs/',
+    'http://minio:9000/lakehouse/silver/syslogs/',
     'minioadmin',
     'minioadmin123'
 );

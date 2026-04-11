@@ -191,21 +191,28 @@ services:
   # ─── Iceberg namespace initialisation ─────────────────────────────────────
   # Creates the bronze and silver namespaces via REST API.
   iceberg-init:
-    image: curlimages/curl:8.7.1
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.iceberg-init
     container_name: iceberg-init
     networks: [network-health-net]
     depends_on:
+      minio-init:
+        condition: service_completed_successfully
       iceberg-rest:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
     command: >
       "
-      curl -sf -X POST http://iceberg-rest:8181/v1/namespaces -H 'Content-Type: application/json' -d '{\"namespace\":[\"bronze\"]}' || true
+      curl -sf -X POST http://iceberg-rest:8181/v1/namespaces -H 'Content-Type: application/json' -d '{\"namespace\":[\"bronze\"]}' || true;
 
-      curl -sf -X POST http://iceberg-rest:8181/v1/namespaces -H 'Content-Type: application/json' -d '{\"namespace\":[\"silver\"]}' || true
+      curl -sf -X POST http://iceberg-rest:8181/v1/namespaces -H 'Content-Type: application/json' -d '{\"namespace\":[\"silver\"]}' || true;
 
-      echo 'Iceberg namespaces ready.'
+      python3 -m sql.iceberg.ddl.init &&
+
+      echo 'Iceberg namespaces ready.';
       "
+    env_file: .env
     restart: on-failure
 
   # ─── ClickHouse (Gold layer + analytics) ──────────────────────────────────
@@ -214,6 +221,11 @@ services:
     container_name: clickhouse
     hostname: clickhouse
     networks: [network-health-net]
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      iceberg-init:
+        condition: service_completed_successfully
     ports:
       - "8123:8123"   # HTTP interface (used by Python clickhouse-connect)
       - "9009:9009"   # native TCP

@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openjdk-21-jre-headless \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY pyproject.toml uv.lock* ./
+RUN uv pip install --system ".[iceberg-init]"
+
+
+COPY ./src ./src
+COPY ./sql/iceberg/ddl ./sql/iceberg/ddl
+COPY ./sql/iceberg/ddl/init.py ./sql/iceberg/ddl/init.py
+
+CMD ["sh", "-c", "echo Ready"]

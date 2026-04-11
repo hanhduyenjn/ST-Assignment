@@ -11,7 +11,10 @@ version = "0.1.0"
 description = "Network Health Platform — PoC"
 readme = {text = "Assignment project", content-type = "text/plain"}
 requires-python = ">=3.11, <3.12"
-dependencies = [
+dependencies = []
+
+[project.optional-dependencies]
+core = [
     "kafka-python==2.0.2",
     "pyspark==3.5.8",
     "pyiceberg[s3]==0.7.1",
@@ -29,13 +32,17 @@ dependencies = [
     "apache-airflow==2.9.1",
 ]
 
-[project.optional-dependencies]
-# Only what Airflow workers need — keeps the image lean
 airflow = [
     "kafka-python==2.0.2",
     "pyiceberg[s3]==0.7.1",
     "pyarrow==14.0.0",
 ]
+
+iceberg-init = [
+    "pyiceberg[s3]==0.7.1",
+    "pyspark==3.5.8",
+]
+
 
 [tool.uv]
 dev-dependencies = [
