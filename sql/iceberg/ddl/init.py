@@ -11,9 +11,9 @@ def init_iceberg_tables():
     spark = SparkSessionFactory.create(mode='batch', app_name='init-iceberg-tables')
 
     # Create namespaces
-    spark.sql('CREATE NAMESPACE IF NOT EXISTS lakehouse.bronze')
-    spark.sql('CREATE NAMESPACE IF NOT EXISTS lakehouse.silver')
-    log.info("Created namespaces: lakehouse.bronze, lakehouse.silver")
+    spark.sql('CREATE NAMESPACE IF NOT EXISTS rest.bronze')
+    spark.sql('CREATE NAMESPACE IF NOT EXISTS rest.silver')
+    log.info("Created namespaces: rest.bronze, rest.silver")
 
     # Read and execute DDL files in this directory
     ddl_dir = Path(__file__).parent
@@ -30,11 +30,11 @@ def init_iceberg_tables():
         # Qualify table names with catalog prefix
         sql_content = sql_content.replace(
             'CREATE TABLE IF NOT EXISTS silver.',
-            'CREATE TABLE IF NOT EXISTS lakehouse.silver.'
+            'CREATE TABLE IF NOT EXISTS rest.silver.'
         )
         sql_content = sql_content.replace(
             'CREATE TABLE IF NOT EXISTS bronze.',
-            'CREATE TABLE IF NOT EXISTS lakehouse.bronze.'
+            'CREATE TABLE IF NOT EXISTS rest.bronze.'
         )
 
         # Remove ORDER BY clauses (not supported in Spark 3.5 CREATE TABLE)
@@ -50,18 +50,18 @@ def init_iceberg_tables():
 
     # Verify
     log.info("\n" + "="*60)
-    log.info("Tables in lakehouse.bronze:")
+    log.info("Tables in rest.bronze:")
     log.info("="*60)
     try:
-        spark.sql('SHOW TABLES IN lakehouse.bronze').show(truncate=False)
+        spark.sql('SHOW TABLES IN rest.bronze').show(truncate=False)
     except Exception as e:
         log.error(f"Error occurred while fetching bronze tables: {e}")
 
     log.info("\n" + "="*60)
-    log.info("Tables in lakehouse.silver:")
+    log.info("Tables in rest.silver:")
     log.info("="*60)
     try:
-        spark.sql('SHOW TABLES IN lakehouse.silver').show(truncate=False)
+        spark.sql('SHOW TABLES IN rest.silver').show(truncate=False)
     except Exception as e:
         log.error(f"Error occurred while fetching silver tables: {e}")
 

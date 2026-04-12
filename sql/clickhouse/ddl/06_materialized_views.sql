@@ -1,13 +1,41 @@
--- Materialized view: promotes anomalies to gold from two sources:
---   1) deduplicated silver.interface_stats_src minute-points (z/iqr/threshold)
---   2) silver_flatline_anomaly_flags (flatline-only staging)
---
--- Steps:
---  1) Deduplicate silver records to one point per (device, interface, minute)
---     using the latest _ingested_at row.
---  2) Expand ingest_flags from those minute-points.
---  3) Promote to gold in 5-minute windows requiring >=3 violating points.
+-- Materialized views are part of the runtime dataflow and must live in the
+-- ClickHouse init directory so they are created on container bootstrap.
 
+CREATE MATERIALIZED VIEW IF NOT EXISTS network_health.mv_site_health_hourly
+REFRESH EVERY 1 MINUTE APPEND
+TO network_health.gold_site_health_hourly
+AS
+SELECT
+    i.site_id,
+    toStartOfHour(i.device_ts)                                        AS window_start,
+    addHours(toStartOfHour(i.device_ts), 1)                           AS window_end,
+    avg(i.effective_util_in)                                          AS avg_util_in,
+    avg(i.effective_util_out)                                         AS avg_util_out,
+    countIf(i.effective_util_in > 80 OR i.effective_util_out > 80)
+        / count()                                                     AS pct_interfaces_saturated,
+    least(toUInt32(any(coalesce(syslog_agg.critical_count, 0))), 4)   AS critical_syslog_count,
+    count()                                                           AS total_interface_count,
+    countIf(i.oper_status != 1) / count()                             AS pct_interfaces_down,
+    now()                                                             AS refreshed_at
+FROM network_health.silver_interface_stats_src AS i
+LEFT JOIN (
+    SELECT
+        site_id,
+        toStartOfHour(device_ts) AS syslog_hour,
+        count()                  AS critical_count
+    FROM network_health.silver_syslogs_src
+    WHERE is_critical = 1
+      AND device_ts >= now() - INTERVAL 25 HOUR
+    GROUP BY site_id, syslog_hour
+) AS syslog_agg
+    ON  syslog_agg.site_id = i.site_id
+    AND syslog_agg.syslog_hour = toStartOfHour(i.device_ts)
+WHERE i.device_ts >= now() - INTERVAL 25 HOUR
+GROUP BY i.site_id, window_start, window_end;
+
+-- Debounced anomaly promotion from:
+--   1) per-record ingest flags on silver interface stats (z-score/iqr/threshold)
+--   2) flatline-only staging table (legacy assignment path)
 CREATE MATERIALIZED VIEW IF NOT EXISTS network_health.mv_anomaly_summary
 REFRESH EVERY 1 MINUTE APPEND
 TO network_health.gold_anomaly_flags
@@ -99,3 +127,35 @@ FROM (
     WHERE anomaly_type = 'FLATLINE'
       AND detected_at >= now() - INTERVAL 25 HOUR
 );
+
+-- Syslog anomaly monitoring using the same debounced promotion mechanism.
+-- Promotes CRITICAL_SYSLOG_BURST when a device emits >=3 critical syslogs in 5 minutes.
+CREATE MATERIALIZED VIEW IF NOT EXISTS network_health.mv_syslog_anomaly_summary
+REFRESH EVERY 1 MINUTE APPEND
+TO network_health.gold_anomaly_flags
+AS
+SELECT
+    device_id,
+    any(site_id) AS site_id,
+    '' AS interface_name,
+    window_start,
+    addMinutes(window_start, 5) AS window_end,
+    'CRITICAL_SYSLOG_BURST' AS anomaly_type,
+    'SEVERITY_LT3_RATE' AS anomaly_subtype,
+    toFloat32(count()) AS score,
+    toFloat32(0.0) AS mean_util_in,
+    toFloat32(0.0) AS std_util_in,
+    max(_ingested_at) AS detected_at
+FROM (
+    SELECT
+        device_id,
+        site_id,
+        _ingested_at,
+        toStartOfInterval(device_ts, INTERVAL 5 MINUTE) AS window_start
+    FROM network_health.silver_syslogs_src
+    WHERE is_critical = 1
+      AND length(ifNull(device_id, '')) > 0
+      AND device_ts >= now() - INTERVAL 25 HOUR
+)
+GROUP BY device_id, window_start
+HAVING count() >= 3;

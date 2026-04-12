@@ -29,6 +29,14 @@ class ClickHouseWriter:
         data = [tuple(row.get(col) for col in columns) for row in rows]
         self.client.insert(table=table, data=data, column_names=columns)
 
+    def upsert_baseline_params(self, rows: list[dict[str, Any]]) -> None:
+        """Upsert baseline parameter rows into ClickHouse.
+
+        The target table uses ReplacingMergeTree(valid_from), so a plain insert
+        is sufficient; the latest version wins on merge.
+        """
+        self.insert_dicts("device_baseline_params", rows)
+
     def query(self, sql: str) -> list[dict[str, Any]]:
         result = self.client.query(sql)
         rows: list[dict[str, Any]] = []

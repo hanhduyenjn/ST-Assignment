@@ -1,10 +1,10 @@
 {
   "title": "Pipeline Dashboard",
   "uid": "pipeline",
-  "version": 1,
+  "version": 2,
   "schemaVersion": 38,
   "refresh": "30s",
-  "time": { "from": "now-3h", "to": "now" },
+  "time": { "from": "now-24h", "to": "now" },
   "tags": ["network-health", "pipeline"],
   "panels": [
     {
@@ -12,11 +12,10 @@
       "title": "Records Ingested / sec",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "uid": "prometheus" },
+      "datasource": { "uid": "clickhouse" },
       "targets": [
         {
-          "expr": "rate(records_ingested_total[1m])",
-          "legendFormat": "{{source}} / {{topic}}"
+          "rawSql": "SELECT toStartOfMinute(_ingested_at) AS time, 'silver_ingest' AS metric, count() / 60.0 AS value FROM network_health.silver_interface_stats_src WHERE _ingested_at >= now() - INTERVAL 24 HOUR GROUP BY time, metric ORDER BY time"
         }
       ]
     },
@@ -25,11 +24,10 @@
       "title": "DLQ Rate (% of ingested)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "uid": "prometheus" },
+      "datasource": { "uid": "clickhouse" },
       "targets": [
         {
-          "expr": "rate(dlq_records_total[1m]) / (rate(records_validated_total[1m]) + 1) * 100",
-          "legendFormat": "DLQ %"
+          "rawSql": "WITH ing AS (SELECT toStartOfMinute(_ingested_at) AS t, count() AS c FROM network_health.silver_interface_stats_src WHERE _ingested_at >= now() - INTERVAL 24 HOUR GROUP BY t), dlq AS (SELECT toStartOfMinute(quarantined_at) AS t, count() AS c FROM network_health.silver_dlq_quarantine_src WHERE quarantined_at >= now() - INTERVAL 24 HOUR GROUP BY t) SELECT ing.t AS time, 'DLQ %' AS metric, ifNull(dlq.c, 0) / greatest(toFloat64(ing.c) + ifNull(dlq.c, 0), 1.0) * 100 AS value FROM ing LEFT JOIN dlq ON ing.t = dlq.t ORDER BY time"
         }
       ],
       "fieldConfig": {
@@ -47,14 +45,13 @@
     },
     {
       "id": 3,
-      "title": "Kafka Consumer Lag",
+      "title": "Pipeline Freshness Lag (seconds)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "uid": "prometheus" },
+      "datasource": { "uid": "clickhouse" },
       "targets": [
         {
-          "expr": "kafka_consumer_lag",
-          "legendFormat": "{{topic}} / partition {{partition}}"
+          "rawSql": "SELECT now() AS time, 'silver_event_lag_s' AS metric, greatest(toFloat64(dateDiff('second', max(device_ts), now())), 0.0) AS value FROM network_health.silver_interface_stats_src WHERE device_ts >= now() - INTERVAL 24 HOUR UNION ALL SELECT now() AS time, 'silver_ingest_lag_s' AS metric, greatest(toFloat64(dateDiff('second', max(_ingested_at), now())), 0.0) AS value FROM network_health.silver_interface_stats_src WHERE _ingested_at >= now() - INTERVAL 24 HOUR UNION ALL SELECT now() AS time, 'gold_anomaly_lag_s' AS metric, greatest(toFloat64(dateDiff('second', max(detected_at), now())), 0.0) AS value FROM network_health.gold_anomaly_flags FINAL WHERE detected_at >= now() - INTERVAL 24 HOUR"
         }
       ]
     },
@@ -63,11 +60,10 @@
       "title": "Pipeline Latency per Stage (p99)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "uid": "prometheus" },
+      "datasource": { "uid": "clickhouse" },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, rate(pipeline_latency_seconds_bucket[5m]))",
-          "legendFormat": "p99 {{stage}}"
+          "rawSql": "SELECT toStartOfMinute(_ingested_at) AS time, 'silver_ingest_p99_s' AS metric, quantileTDigest(0.99)(greatest(toFloat64(dateDiff('second', device_ts, _ingested_at)), 0.0)) AS value FROM network_health.silver_interface_stats_src WHERE _ingested_at >= now() - INTERVAL 24 HOUR AND device_ts IS NOT NULL AND _ingested_at IS NOT NULL GROUP BY time UNION ALL SELECT toStartOfMinute(detected_at) AS time, 'gold_promote_p99_s' AS metric, quantileTDigest(0.99)(greatest(toFloat64(dateDiff('second', window_start, detected_at)), 0.0)) AS value FROM network_health.gold_anomaly_flags FINAL WHERE detected_at >= now() - INTERVAL 24 HOUR GROUP BY time ORDER BY time"
         }
       ],
       "fieldConfig": { "defaults": { "unit": "s" } }

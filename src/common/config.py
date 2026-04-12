@@ -31,3 +31,11 @@ CONSUMER_TIMEOUT_MS = int(os.environ.get("CONSUMER_TIMEOUT_MS", "15000"))
 BRONZE_INTERFACE_STATS = "bronze.interface_stats"
 BRONZE_SYSLOGS = "bronze.syslogs"
 BRONZE_INVENTORY = "bronze.inventory"
+
+# Set to a value < 1.0 (e.g. "0.1") to sample input tables in batch/nightly jobs.
+# Useful for smoke-testing pipelines without processing the full dataset.
+SAMPLE_FRACTION = float(os.environ.get("SAMPLE_FRACTION", "1.0"))
+
+# Hard row cap applied after sampling. 0 = disabled.
+# Use this to guarantee a tiny dataset regardless of table size (e.g. SMOKE_MAX_ROWS=500).
+SMOKE_MAX_ROWS = int(os.environ.get("SMOKE_MAX_ROWS", "0"))

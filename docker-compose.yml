@@ -1,5 +1,3 @@
-version: "3.9"
-
 # Credentials and config are loaded from .env (see .env.example for the template).
 # For the ST assignment the .env file is committed so the stack runs as-is.
 
@@ -18,7 +16,7 @@ volumes:
   postgres-data:
   airflow-logs:
 
-# ─── Airflow common config (shared by scheduler + webserver) ──────────────────
+# ─── Common configurations ───────────────────────────────────────────────────
 x-airflow-common: &airflow-common
   build:
     context: .
@@ -41,9 +39,20 @@ x-airflow-common: &airflow-common
     postgres:
       condition: service_healthy
 
+x-app-service: &app-service
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  networks: [network-health-net]
+  env_file: .env
+  restart: unless-stopped
+
 services:
 
-  # ─── Kafka coordination ────────────────────────────────────────────────────
+  # ╔════════════════════════════════════════════════════════════════════════════╗
+  # ║                          Infrastructure                                    ║
+  # ╚════════════════════════════════════════════════════════════════════════════╝
+
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
     container_name: zookeeper
@@ -62,7 +71,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # ─── Message broker ────────────────────────────────────────────────────────
   kafka:
     image: confluentinc/cp-kafka:7.6.1
     container_name: kafka
@@ -83,8 +91,8 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_LOG_RETENTION_HOURS: 168          # 7 days
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false" # topics created explicitly below
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:
@@ -93,8 +101,6 @@ services:
       timeout: 10s
       retries: 10
 
-  # ─── Kafka topic initialisation ────────────────────────────────────────────
-  # Creates the 4 topics defined in section 11 of the implementation plan.
   kafka-init:
     image: confluentinc/cp-kafka:7.6.1
     container_name: kafka-init
@@ -105,19 +111,14 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command: >
       "
-      kafka-topics --create --if-not-exists --topic raw.interface.stats --bootstrap-server kafka:29092  --partitions 3 --replication-factor 1 --config retention.ms=604800000
-
-      kafka-topics --create --if-not-exists --topic raw.syslogs --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1 --config retention.ms=604800000
-
-      kafka-topics --create --if-not-exists --topic raw.inventory --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1 --config cleanup.policy=compact --config retention.ms=-1
-
-      kafka-topics --create --if-not-exists --topic output.anomaly.alerts --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1 --config retention.ms=604800000
-
+      kafka-topics --create --if-not-exists --topic raw.interface.stats --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1 --config retention.ms=604800000 &&
+      kafka-topics --create --if-not-exists --topic raw.syslogs --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1 --config retention.ms=604800000 &&
+      kafka-topics --create --if-not-exists --topic raw.inventory --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1 --config cleanup.policy=compact --config retention.ms=-1 &&
+      kafka-topics --create --if-not-exists --topic output.anomaly.alerts --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1 --config retention.ms=604800000 &&
       echo 'Kafka topics created.'
       "
     restart: on-failure
 
-  # ─── Object store (on-prem S3-compatible) ─────────────────────────────────
   minio:
     image: firstfinger/minio:1.7.3
     container_name: minio
@@ -139,8 +140,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # ─── MinIO bucket initialisation ──────────────────────────────────────────
-  # Creates the lakehouse bucket and top-level prefixes on first start.
   minio-init:
     image: minio/mc:RELEASE.2025-08-13T08-35-41Z
     container_name: minio-init
@@ -162,7 +161,6 @@ services:
     env_file: .env
     restart: on-failure
 
-  # ─── Iceberg REST Catalog ──────────────────────────────────────────────────
   iceberg-rest:
     image: tabulario/iceberg-rest:0.10.0
     container_name: iceberg-rest
@@ -170,6 +168,8 @@ services:
     networks: [network-health-net]
     depends_on:
       minio-init:
+        condition: service_completed_successfully
+      postgres-init:
         condition: service_completed_successfully
     ports:
       - "8181:8181"
@@ -181,6 +181,11 @@ services:
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://minio:9000
       CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      # PostgreSQL metadata store — env vars map as: strip CATALOG_, _ → .
+      CATALOG_URI: jdbc:postgresql://postgres:5432/iceberg_catalog
+      CATALOG_JDBC_USER: iceberg
+      CATALOG_JDBC_PASSWORD: iceberg_password
+      CATALOG_JDBC_INIT_SCHEMA: "true"
     env_file: .env
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8181 && echo -e 'GET /v1/config HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q '200'"]
@@ -188,8 +193,6 @@ services:
       timeout: 5s
       retries: 10
 
-  # ─── Iceberg namespace initialisation ─────────────────────────────────────
-  # Creates the bronze and silver namespaces via REST API.
   iceberg-init:
     build:
       context: .
@@ -205,17 +208,13 @@ services:
     command: >
       "
       curl -sf -X POST http://iceberg-rest:8181/v1/namespaces -H 'Content-Type: application/json' -d '{\"namespace\":[\"bronze\"]}' || true;
-
       curl -sf -X POST http://iceberg-rest:8181/v1/namespaces -H 'Content-Type: application/json' -d '{\"namespace\":[\"silver\"]}' || true;
-
       python3 -m sql.iceberg.ddl.init &&
-
       echo 'Iceberg namespaces ready.';
       "
     env_file: .env
     restart: on-failure
 
-  # ─── ClickHouse (Gold layer + analytics) ──────────────────────────────────
   clickhouse:
     image: clickhouse/clickhouse-server:25.8
     container_name: clickhouse
@@ -227,7 +226,7 @@ services:
       iceberg-init:
         condition: service_completed_successfully
     ports:
-      - "8123:8123"   # HTTP interface (used by Python clickhouse-connect)
+      - "8123:8123"   # HTTP interface
       - "9009:9009"   # native TCP
     environment:
       CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE}
@@ -235,7 +234,6 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     volumes:
       - clickhouse-data:/var/lib/clickhouse
-      # DDL files are applied in filename order on first startup
       - ./sql/clickhouse/ddl:/docker-entrypoint-initdb.d:ro
     env_file: .env
     healthcheck:
@@ -248,15 +246,32 @@ services:
         soft: 262144
         hard: 262144
 
-  # ─── Spark Master ─────────────────────────────────────────────────────────
+  clickhouse-baseline-refresh-trigger:
+    image: clickhouse/clickhouse-server:25.8
+    container_name: clickhouse-baseline-refresh-trigger
+    hostname: clickhouse-baseline-refresh-trigger
+    networks: [network-health-net]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "
+      while true; do
+        clickhouse-client --host clickhouse --query \"SYSTEM REFRESH VIEW network_health.mv_device_baseline_refresh\";
+        sleep ${BASELINE_REFRESH_INTERVAL_SECONDS:-300};
+      done
+      "
+    restart: unless-stopped
+
   spark-master:
     image: bitnamilegacy/spark:3.5.1
     container_name: spark-master
     hostname: spark-master
     networks: [network-health-net]
     ports:
-      - "8080:8080"   # Spark Master UI
-      - "7077:7077"   # Spark submit endpoint
+      - "8080:8080"   # UI
+      - "7077:7077"   # submit endpoint
     environment:
       SPARK_MODE: master
       SPARK_RPC_AUTHENTICATION_ENABLED: "no"
@@ -269,7 +284,6 @@ services:
       timeout: 10s
       retries: 5
 
-  # ─── Spark Worker ─────────────────────────────────────────────────────────
   spark-worker:
     image: bitnamilegacy/spark:3.5.1
     container_name: spark-worker
@@ -279,7 +293,7 @@ services:
       spark-master:
         condition: service_healthy
     ports:
-      - "8081:8081"   # Spark Worker UI
+      - "8081:8081"   # UI
     environment:
       SPARK_MODE: worker
       SPARK_MASTER_URL: ${SPARK_MASTER_URL}
@@ -291,7 +305,48 @@ services:
       SPARK_SSL_ENABLED: "no"
     env_file: .env
 
-  # ─── Prometheus (metrics collection) ──────────────────────────────────────
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    hostname: postgres
+    networks: [network-health-net]
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-init:
+    image: postgres:16
+    container_name: postgres-init
+    hostname: postgres-init
+    networks: [network-health-net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: airflow
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "
+      set -e;
+      psql -h postgres -U airflow -d postgres -tAc \"SELECT 1 FROM pg_roles WHERE rolname='iceberg'\" | grep -q 1 || psql -h postgres -U airflow -d postgres -v ON_ERROR_STOP=1 -c \"CREATE ROLE iceberg LOGIN PASSWORD 'iceberg_password';\";
+      psql -h postgres -U airflow -d postgres -v ON_ERROR_STOP=1 -c \"ALTER ROLE iceberg WITH LOGIN PASSWORD 'iceberg_password';\";
+      psql -h postgres -U airflow -d postgres -tAc \"SELECT 1 FROM pg_database WHERE datname='iceberg_catalog'\" | grep -q 1 || createdb -h postgres -U airflow -O iceberg iceberg_catalog;
+      psql -h postgres -U airflow -d postgres -v ON_ERROR_STOP=1 -c \"GRANT ALL PRIVILEGES ON DATABASE iceberg_catalog TO iceberg;\";
+      "
+    restart: on-failure
+
+  # ╔════════════════════════════════════════════════════════════════════════════╗
+  # ║                          Observability                                     ║
+  # ╚════════════════════════════════════════════════════════════════════════════╝
+
   prometheus:
     image: prom/prometheus:v2.52.0
     container_name: prometheus
@@ -314,7 +369,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # ─── Alertmanager ─────────────────────────────────────────────────────────
   alertmanager:
     image: prom/alertmanager:v0.27.0
     container_name: alertmanager
@@ -328,7 +382,6 @@ services:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
       - "--storage.path=/alertmanager"
 
-  # ─── Grafana (dashboards) ─────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:10.4.3
     container_name: grafana
@@ -358,7 +411,6 @@ services:
       timeout: 5s
       retries: 10
 
-  # ─── Kafka UI ─────────────────────────────────────────────────────────────
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
@@ -374,25 +426,10 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
       KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
 
-  # ─── Airflow metadata DB ─────────────────────────────────────────────────────
-  postgres:
-    image: postgres:16
-    container_name: postgres
-    hostname: postgres
-    networks: [network-health-net]
-    environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+  # ╔════════════════════════════════════════════════════════════════════════════╗
+  # ║                          Orchestration                                     ║
+  # ╚════════════════════════════════════════════════════════════════════════════╝
 
-  # ─── Airflow DB init (runs once, then exits) ──────────────────────────────
   airflow-init:
     <<: *airflow-common
     container_name: airflow-init
@@ -405,7 +442,6 @@ services:
       "
     restart: on-failure
 
-  # ─── Airflow Scheduler ────────────────────────────────────────────────────
   airflow-scheduler:
     <<: *airflow-common
     container_name: airflow-scheduler
@@ -420,7 +456,6 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ─── Airflow Webserver ────────────────────────────────────────────────────
   airflow-webserver:
     <<: *airflow-common
     container_name: airflow-webserver
@@ -432,7 +467,7 @@ services:
       airflow-init:
         condition: service_completed_successfully
     ports:
-      - "8085:8080"   # Airflow UI (8080 is taken by Spark Master)
+      - "8085:8080"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
       interval: 10s
@@ -440,14 +475,71 @@ services:
       retries: 10
     restart: unless-stopped
 
-  # ─── Pipeline application (consumers + all pipeline modes) ────────────────
-  app:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-    container_name: app
-    hostname: app
-    networks: [network-health-net]
+  # ╔════════════════════════════════════════════════════════════════════════════╗
+  # ║                          Data Producers                                    ║
+  # ║         Continuously generate synthetic data across Kafka topics           ║
+  # ╚════════════════════════════════════════════════════════════════════════════╝
+
+  synthetic-data-init:
+    <<: *app-service
+    container_name: synthetic-data-init
+    hostname: synthetic-data-init
+    restart: "no"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+    entrypoint: ["uv", "run", "python", "scripts/generate_synthetic_data.py"]
+
+  producer-interface:
+    <<: *app-service
+    container_name: producer-interface
+    hostname: producer-interface
+    depends_on:
+      kafka:
+        condition: service_healthy
+      synthetic-data-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/app/data:ro
+    command: ["--mode", "produce-interface"]
+
+  producer-syslogs:
+    <<: *app-service
+    container_name: producer-syslogs
+    hostname: producer-syslogs
+    depends_on:
+      kafka:
+        condition: service_healthy
+      synthetic-data-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/app/data:ro
+    command: ["--mode", "produce-syslogs"]
+
+  producer-inventory:
+    <<: *app-service
+    container_name: producer-inventory
+    hostname: producer-inventory
+    depends_on:
+      kafka:
+        condition: service_healthy
+      synthetic-data-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/app/data:ro
+    command: ["--mode", "produce-inventory"]
+
+  # ╔════════════════════════════════════════════════════════════════════════════╗
+  # ║                          Streaming Pipeline                                ║
+  # ║         Bronze → Silver → Gold transformations with enrichment            ║
+  # ╚════════════════════════════════════════════════════════════════════════════╝
+
+  bronze-ingest:
+    <<: *app-service
+    container_name: bronze-ingest
+    hostname: bronze-ingest
     depends_on:
       kafka:
         condition: service_healthy
@@ -455,9 +547,55 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
-    env_file: .env
+    command: ["--mode", "bronze-ingest"]
+
+  streaming:
+    <<: *app-service
+    container_name: streaming
+    hostname: streaming
+    environment:
+      FLATLINE_VARIANCE_THRESHOLD: "0.01"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    command: ["--mode", "streaming"]
+
+  flatline-streaming:
+    <<: *app-service
+    container_name: flatline-streaming
+    hostname: flatline-streaming
+    profiles: ["legacy-anomaly-streams"]
+    environment:
+      FLATLINE_WATERMARK_DELAY: "1 minute"
+      FLATLINE_VARIANCE_THRESHOLD: "0.01"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      streaming:
+        condition: service_started
+    command: ["--mode", "flatline-streaming"]
+
+  query-api:
+    <<: *app-service
+    container_name: query-api
+    hostname: query-api
+    depends_on:
+      kafka:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
     ports:
-      - "${PROMETHEUS_PORT:-8000}:8000"   # Prometheus metrics + FastAPI bridge
+      - "${PROMETHEUS_PORT:-8000}:8000"
     volumes:
       - ./data:/app/data:ro
-    restart: unless-stopped
+    command: ["--mode", "query-api", "--host", "0.0.0.0", "--port", "8000"]

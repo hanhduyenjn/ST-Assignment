@@ -1,0 +1,99 @@
+{
+  "title": "Health Dashboard",
+  "uid": "health",
+  "version": 2,
+  "schemaVersion": 38,
+  "refresh": "1m",
+  "time": { "from": "now-48h", "to": "now" },
+  "tags": ["network-health", "health"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Site Health Score Trend (hourly)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT window_start AS time, site_id AS metric, avg(health_score) AS value FROM network_health.gold_site_health_hourly FINAL WHERE window_start >= now() - INTERVAL 7 DAY GROUP BY time, metric ORDER BY time, metric"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 40 },
+              { "color": "green", "value": 70 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Interface Saturation % by Site",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT window_start AS time, site_id AS metric, avg(pct_interfaces_saturated) * 100 AS value FROM network_health.gold_site_health_hourly FINAL WHERE window_start >= now() - INTERVAL 48 HOUR GROUP BY time, metric ORDER BY time, metric"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "id": 3,
+      "title": "Interfaces Down % by Site",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT window_start AS time, site_id AS metric, avg(pct_interfaces_down) * 100 AS value FROM network_health.gold_site_health_hourly FINAL WHERE window_start >= now() - INTERVAL 48 HOUR GROUP BY time, metric ORDER BY time, metric"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "id": 4,
+      "title": "Critical Syslog Count (hourly)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT window_start AS time, site_id AS metric, sum(critical_syslog_count) AS value FROM network_health.gold_site_health_hourly FINAL WHERE window_start >= now() - INTERVAL 48 HOUR GROUP BY time, metric ORDER BY time, metric"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Degraded Site Windows (last 48h)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT site_id, window_start, health_score, pct_interfaces_saturated, pct_interfaces_down, critical_syslog_count FROM network_health.gold_site_health_hourly FINAL WHERE window_start >= now() - INTERVAL 48 HOUR AND is_degraded = 1 ORDER BY window_start DESC, site_id"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Current Average Health",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT avg(health_score) AS avg_health_score FROM (SELECT site_id, argMax(health_score, window_start) AS health_score FROM network_health.gold_site_health_hourly FINAL WHERE window_start >= now() - INTERVAL 48 HOUR GROUP BY site_id)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "min": 0, "max": 100 } }
+    }
+  ]
+}

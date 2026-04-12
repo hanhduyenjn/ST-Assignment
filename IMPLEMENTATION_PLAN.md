@@ -509,7 +509,6 @@ Written by nightly batch jobs. Read by streaming job as broadcast join.
 | `baseline_mean` | Float32 | 30-day rolling mean |
 | `baseline_std` | Float32 | 30-day rolling std |
 | `iqr_k` | Float32 | IQR fence multiplier (typically 1.5) |
-| `ewma_alpha` | Float32 | fit from autocorrelation |
 | `isolation_score_threshold` | Float32 | 95th pct of normal scores |
 | `distilled_rules` | String | JSON-encoded decision tree rules |
 | `valid_from` | DateTime | |

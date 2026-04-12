@@ -95,4 +95,14 @@ class IsolationForestDetector(AnomalyDetector):
 
     @staticmethod
     def save_rules(rules: dict[str, Any], path: str | Path) -> None:
-        Path(path).write_text(json.dumps(rules), encoding="utf-8")
+        class _NumpyEncoder(json.JSONEncoder):
+            def default(self, obj: Any) -> Any:
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                if isinstance(obj, np.integer):
+                    return int(obj)
+                if isinstance(obj, np.floating):
+                    return float(obj)
+                return super().default(obj)
+
+        Path(path).write_text(json.dumps(rules, cls=_NumpyEncoder), encoding="utf-8")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 from airflow import DAG
@@ -15,4 +16,9 @@ with DAG(
     backfill = BashOperator(
         task_id="backfill",
         bash_command="python -m src.pipeline.batch",
+        env={
+            "SAMPLE_FRACTION": os.environ.get("SAMPLE_FRACTION", "1.0"),
+            "SMOKE_MAX_ROWS": os.environ.get("SMOKE_MAX_ROWS", "0"),
+        },
+        append_env=True,
     )

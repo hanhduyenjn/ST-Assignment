@@ -5,9 +5,13 @@ import argparse
 from src.monitoring.exporter import run_metrics_exporter
 from src.pipeline.batch import run as run_backfill
 from src.pipeline.bronze_ingest import run as run_bronze_ingest
+from src.pipeline.baseline_refresh import run as run_baseline_refresh
 from src.pipeline.dlq_reprocessor import run as run_dlq_reprocessor
+from src.pipeline.flatline_streaming_v1 import run as run_flatline_streaming_v1
 from src.pipeline.gold_recompute import run as run_gold_recompute
+from src.pipeline.isolation_forest_train import run as run_isolation_forest_train
 from src.pipeline.pending_enrichment import run as run_pending_enrichment
+from src.pipeline.psi_drift_detect import run as run_psi_drift_detect
 from src.pipeline.streaming import run as run_streaming
 from src.producers.producer_kafka import (
     produce_interface_stats,
@@ -27,9 +31,13 @@ def _parser() -> argparse.ArgumentParser:
             "produce-syslogs",
             "produce-inventory",
             "bronze-ingest",
+            "baseline-refresh",
             "streaming",
+            "flatline-streaming",
             "pending-enrichment",
             "gold-recompute",
+            "isolation-forest-train",
+            "psi-drift-detect",
             "backfill",
             "dlq-reprocess",
             "query-api",
@@ -52,12 +60,20 @@ def main() -> None:
         produce_inventory()
     elif args.mode == "bronze-ingest":
         run_bronze_ingest()
+    elif args.mode == "baseline-refresh":
+        run_baseline_refresh()
     elif args.mode == "streaming":
         run_streaming()
+    elif args.mode == "flatline-streaming":
+        run_flatline_streaming_v1()
     elif args.mode == "pending-enrichment":
         run_pending_enrichment()
     elif args.mode == "gold-recompute":
         run_gold_recompute()
+    elif args.mode == "isolation-forest-train":
+        run_isolation_forest_train()
+    elif args.mode == "psi-drift-detect":
+        run_psi_drift_detect()
     elif args.mode == "backfill":
         run_backfill()
     elif args.mode == "dlq-reprocess":

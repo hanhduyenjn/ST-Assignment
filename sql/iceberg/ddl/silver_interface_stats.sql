@@ -15,10 +15,11 @@ CREATE TABLE IF NOT EXISTS silver.interface_stats (
     effective_util_out  double      COMMENT 'zeroed when oper_status IN (2,3)',
     admin_status        int,
     oper_status         int,
-    ingest_z_score      double      COMMENT 'z-score vs device baseline_mean/std',
-    ingest_iqr_score    double      COMMENT 'IQR fence score vs rolling 4h window',
-    ingest_anomaly      boolean     COMMENT 'true if ingest-time anomaly rule fired',
-    _extra_cols         map<string, string>  COMMENT 'schema-evolved extra columns',
+    ingest_z_score      double              COMMENT 'z-score vs device baseline_mean/std',
+    ingest_iqr_score    double              COMMENT 'IQR fence score vs rolling 4h window',
+    ingest_anomaly      boolean             COMMENT 'true if ingest-time anomaly rule fired',
+    ingest_flags        array<string>       COMMENT 'list of fired anomaly flag names',
+    _extra_cols         map<string, string> COMMENT 'schema-evolved extra columns',
     _ingested_at        timestamp,
     _partition_date     date
 )

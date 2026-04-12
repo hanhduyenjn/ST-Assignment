@@ -122,7 +122,7 @@ def apply_ingest_scores(enriched_df: DataFrame, baseline_df: DataFrame) -> DataF
     hour_of_day, day_of_week) using a left join so unmatched rows are preserved.
 
     day_of_week mapping: Spark dayofweek() returns 1=Sun..7=Sat; baseline params
-    use 0=Mon..6=Sun (pandas/ISO convention).  We map via (dayofweek-1) % 7.
+    use 0=Mon..6=Sun (pandas/ISO convention).  We map via (dayofweek+5) % 7.
     """
     bl = baseline_df.select(
         F.col("device_id").alias("_bl_did"),
@@ -137,7 +137,7 @@ def apply_ingest_scores(enriched_df: DataFrame, baseline_df: DataFrame) -> DataF
     with_keys = (
         enriched_df
         .withColumn("_hour", F.hour("device_ts").cast("int"))
-        .withColumn("_dow",  ((F.dayofweek("device_ts") - 1) % 7).cast("int"))
+        .withColumn("_dow",  ((F.dayofweek("device_ts") + 5) % 7).cast("int"))
     )
 
     joined = with_keys.join(
@@ -160,7 +160,7 @@ def apply_ingest_scores(enriched_df: DataFrame, baseline_df: DataFrame) -> DataF
         .withColumn("ingest_z_score",  F.coalesce(z_score,   F.lit(0.0)))
         .withColumn("ingest_iqr_score", F.coalesce(iqr_score, F.lit(0.0)))
         .withColumn("_thr",  (F.col("effective_util_in") > 80) | (F.col("effective_util_out") > 80))
-        .withColumn("_z",    F.col("ingest_z_score")   > F.lit(3.0))
+        .withColumn("_z",    F.col("ingest_z_score")   > F.lit(2.0))
         .withColumn("_iqr",  F.col("ingest_iqr_score") > F.lit(1.0))
         .withColumn("ingest_anomaly", F.col("_thr") | F.col("_z") | F.col("_iqr"))
         .withColumn(

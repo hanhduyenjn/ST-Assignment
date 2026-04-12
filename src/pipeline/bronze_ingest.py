@@ -118,6 +118,9 @@ def _build_interface_stats_stream(spark: SparkSession):
         .withColumn("_all", F.from_json(F.col("_raw_payload"), MapType(StringType(), StringType())))
     )
 
+    # Create known columns array once (outside lambda) for serialization in streaming context
+    known_cols_array = F.array(*[F.lit(c) for c in _INTERFACE_STATS_KNOWN])
+
     df = parsed.select(
         F.col("_raw_payload"),
         F.col("_parsed.ts").alias("ts"),
@@ -129,7 +132,7 @@ def _build_interface_stats_stream(spark: SparkSession):
         F.col("_parsed.oper_status").alias("oper_status"),
         F.map_filter(
             F.col("_all"),
-            lambda k, _: ~F.array_contains(F.array(*[F.lit(c) for c in _INTERFACE_STATS_KNOWN]), k),
+            lambda k, _: ~F.array_contains(known_cols_array, k),
         ).alias("_extra_cols"),
     )
 
@@ -144,6 +147,10 @@ def _build_syslogs_stream(spark: SparkSession):
         .withColumn("_parsed", F.from_json(F.col("_raw_payload"), _SYSLOGS_SCHEMA))
         .withColumn("_all", F.from_json(F.col("_raw_payload"), MapType(StringType(), StringType())))
     )
+
+    # Create known columns array once (outside lambda) for serialization in streaming context
+    known_cols_array = F.array(*[F.lit(c) for c in _SYSLOGS_KNOWN])
+
     df = (
         parsed
         .select(
@@ -154,7 +161,7 @@ def _build_syslogs_stream(spark: SparkSession):
             F.col("_parsed.message").alias("message"),
             F.map_filter(
                 F.col("_all"),
-                lambda k, _: ~F.array_contains(F.array(*[F.lit(c) for c in _SYSLOGS_KNOWN]), k),
+                lambda k, _: ~F.array_contains(known_cols_array, k),
             ).alias("_extra_cols"),
         )
     )
@@ -169,6 +176,10 @@ def _build_inventory_stream(spark: SparkSession):
         .withColumn("_parsed", F.from_json(F.col("_raw_payload"), _INVENTORY_SCHEMA))
         .withColumn("_all", F.from_json(F.col("_raw_payload"), MapType(StringType(), StringType())))
     )
+
+    # Create known columns array once (outside lambda) for serialization in streaming context
+    known_cols_array = F.array(*[F.lit(c) for c in _INVENTORY_KNOWN])
+
     df = (
         parsed
         .select(
@@ -178,7 +189,7 @@ def _build_inventory_stream(spark: SparkSession):
             F.col("_parsed.role").alias("role"),
             F.map_filter(
                 F.col("_all"),
-                lambda k, _: ~F.array_contains(F.array(*[F.lit(c) for c in _INVENTORY_KNOWN]), k),
+                lambda k, _: ~F.array_contains(known_cols_array, k),
             ).alias("_extra_cols"),
         )
     )
@@ -192,7 +203,7 @@ def _align_to_table_schema(df, spark: SparkSession, target_table: str):
     This makes ingestion resilient when consumer payload shape evolves before
     DDL changes are applied (extra columns are dropped; missing columns filled null).
     """
-    target_cols = spark.table(target_table).columns
+    target_cols = [field.name for field in spark.table(target_table).schema.fields]
     for col_name in target_cols:
         if col_name not in df.columns:
             df = df.withColumn(col_name, F.lit(None))
@@ -205,7 +216,7 @@ def _ensure_table_schema(df, spark: SparkSession, target_table: str) -> None:
     If the incoming micro-batch has columns that are not in the target table,
     add them with inferred Spark SQL types before append.
     """
-    target_cols = set(spark.table(target_table).columns)
+    target_cols = {field.name for field in spark.table(target_table).schema.fields}
     incoming_fields = {field.name: field.dataType.simpleString() for field in df.schema.fields}
 
     for col_name, sql_type in incoming_fields.items():

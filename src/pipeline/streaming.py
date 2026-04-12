@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Any
@@ -19,6 +20,7 @@ from src.common.config import (
 )
 from src.common.logging import log
 from src.common.spark_session import SparkSessionFactory
+from src.pipeline.silver_transforms import build_silver_dlq, build_silver_interface, build_silver_pending, build_silver_syslogs
 from src.storage.clickhouse_writer import ClickHouseWriter
 from src.storage.iceberg_writer import IcebergWriter
 from src.transforms.effective_util import effective_util_expr
@@ -42,6 +44,10 @@ KAFKA_GROUP_INVENTORY = "main-streaming-inventory-v1"
 _inventory_lock = threading.Lock()
 _inventory_cache: dict[str, dict[str, str | None]] = {}  # device_id → {site_id, vendor, role}
 
+# Serialize Iceberg appends across concurrent foreachBatch callbacks to avoid
+# commit-contention spikes and JVM instability under heavy micro-batches.
+_iceberg_write_lock = threading.Lock()
+
 # ---------------------------------------------------------------------------
 # Device baseline params cache — loaded from ClickHouse device_baseline_params.
 # Refreshed every BASELINE_TTL_SECONDS (30 min) so weekly model retrain results
@@ -52,7 +58,6 @@ _baseline_lock = threading.Lock()
 _baseline_params: list[dict] = []
 _baseline_loaded_at: float = 0.0          # time.monotonic() timestamp of last load
 BASELINE_TTL_SECONDS: int = 1800          # refresh every 30 minutes
-
 
 def _load_baseline_params(ch: ClickHouseWriter) -> None:
     """Fetch device_baseline_params from ClickHouse and replace the driver-side cache."""
@@ -98,7 +103,7 @@ def _apply_ingest_scores(enriched_df: DataFrame, spark) -> DataFrame:
 
     HIGH_Z_SCORE  (requires baseline params)
         z = |effective_util_in - baseline_mean| / (baseline_std + ε)
-        flag when z > 3  (3-sigma rule)
+        flag when z > 2
 
     IQR_OUTLIER  (requires baseline params)
         iqr_score = |effective_util_in - baseline_mean| / (iqr_k × baseline_std + ε)
@@ -108,9 +113,8 @@ def _apply_ingest_scores(enriched_df: DataFrame, spark) -> DataFrame:
     and only THRESHOLD_SATURATED can fire.  Scores will populate fully once the weekly
     IsolationForest train job writes device_baseline_params to ClickHouse.
 
-    Note on day_of_week alignment: Spark dayofweek() returns 1=Sun..7=Sat; the PSI
-    detector writes 0=Mon..6=Sun (pandas convention).  We use (dayofweek-1) % 7 as a
-    best-effort mapping for the PoC.
+    Note on day_of_week alignment: Spark dayofweek() returns 1=Sun..7=Sat; baseline
+    params use 0=Mon..6=Sun.  We map via (dayofweek+5) % 7.
     """
     baseline_df = _get_baseline_df(spark).select(
         F.col("device_id").alias("_bl_device_id"),
@@ -125,7 +129,7 @@ def _apply_ingest_scores(enriched_df: DataFrame, spark) -> DataFrame:
     with_keys = (
         enriched_df
         .withColumn("_hour_of_day", F.hour("device_ts").cast("int"))
-        .withColumn("_day_of_week", ((F.dayofweek("device_ts") - 1) % 7).cast("int"))
+        .withColumn("_day_of_week", ((F.dayofweek("device_ts") + 5) % 7).cast("int"))
     )
 
     joined = with_keys.join(
@@ -149,7 +153,7 @@ def _apply_ingest_scores(enriched_df: DataFrame, spark) -> DataFrame:
         .withColumn("ingest_z_score",   F.coalesce(z_score,   F.lit(0.0)))
         .withColumn("ingest_iqr_score",  F.coalesce(iqr_score, F.lit(0.0)))
         .withColumn("_thr_flag",  (F.col("effective_util_in") > 80) | (F.col("effective_util_out") > 80))
-        .withColumn("_z_flag",    F.col("ingest_z_score")   > F.lit(3.0))
+        .withColumn("_z_flag",    F.col("ingest_z_score")   > F.lit(2.0))
         .withColumn("_iqr_flag",  F.col("ingest_iqr_score") > F.lit(1.0))
         .withColumn("ingest_anomaly", F.col("_thr_flag") | F.col("_z_flag") | F.col("_iqr_flag"))
         .withColumn(
@@ -171,11 +175,8 @@ def _debug(message: str) -> None:
     print(f"[streaming] {message}", flush=True)
 
 
-def _count_rows(df: DataFrame) -> int:
-    return int(df.count())
-
-
 def _kafka_raw_stream(spark, topic: str, group_id: str) -> DataFrame:
+    max_offsets = int(os.environ.get("STREAM_MAX_OFFSETS_PER_TRIGGER", "1200"))
     return (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
@@ -183,22 +184,31 @@ def _kafka_raw_stream(spark, topic: str, group_id: str) -> DataFrame:
         .option("kafka.group.id", group_id)
         .option("startingOffsets", "latest")
         .option("failOnDataLoss", "false")
+        .option("maxOffsetsPerTrigger", str(max_offsets))
         .load()
         .selectExpr("CAST(value AS STRING) as payload", "timestamp as kafka_ts", "topic as source_topic")
     )
 
 
 def _parse_interface_stats(df: DataFrame) -> DataFrame:
+    # Parse all fields as strings first so that legacy messages where the producer
+    # serialised numeric values as JSON strings (e.g. "58.3" instead of 58.3) are
+    # handled correctly.  Explicit casts below are equivalent to the original schema
+    # but tolerate both representations.
     return (
         df.select(
             "payload",
             "source_topic",
             F.from_json(
                 F.col("payload"),
-                "ts string, device_id string, interface_name string, util_in double, util_out double, admin_status int, oper_status int",
+                "ts string, device_id string, interface_name string, util_in string, util_out string, admin_status string, oper_status string",
             ).alias("r")
         )
         .select("payload", "source_topic", "r.*")
+        .withColumn("util_in", F.col("util_in").cast("double"))
+        .withColumn("util_out", F.col("util_out").cast("double"))
+        .withColumn("admin_status", F.col("admin_status").cast("int"))
+        .withColumn("oper_status", F.col("oper_status").cast("int"))
         .withColumn("device_ts", F.to_timestamp("ts"))
         .withColumn("effective_util_in", effective_util_expr("util_in"))
         .withColumn("effective_util_out", effective_util_expr("util_out"))
@@ -266,78 +276,38 @@ def _split_interface_records(batch_df: DataFrame, inventory_latest: DataFrame) -
     return invalid, pending, enriched
 
 
-def _write_dlq(invalid_df: DataFrame, writer: IcebergWriter, invalid_count: int | None = None) -> None:
-    if invalid_count is None:
-        invalid_count = _count_rows(invalid_df)
-    if invalid_count == 0:
-        return
-    log.info("streaming.interface: writing %s invalid rows to DLQ", invalid_count)
-    dlq = invalid_df.select(
-        F.col("payload").alias("raw_payload"),
-        F.col("validation_reason").alias("quarantine_reason"),
-        F.col("source_topic"),
-        F.current_timestamp().alias("quarantined_at"),
-        F.lit(False).alias("reprocessed"),
-        F.lit(None).cast("timestamp").alias("reprocessed_at"),
-        F.lit(None).cast("string").alias("quarantine_resolution"),
-        F.to_date(F.current_timestamp()).alias("_partition_date"),
-    )
-    writer.write_dataframe(dlq, SILVER_DLQ)
+def _write_dlq(invalid_df: DataFrame, writer: IcebergWriter) -> None:
+    log.info("streaming.interface: writing invalid rows to DLQ")
+    dlq = build_silver_dlq(invalid_df, raw_col="payload")
+    try:
+        with _iceberg_write_lock:
+            writer.write_dataframe(dlq, SILVER_DLQ)
+    except Exception as e:
+        log.error("streaming.dlq: write failed (continuing): %s", str(e)[:150])
 
 
-def _write_pending(pending_df: DataFrame, writer: IcebergWriter, pending_count: int | None = None) -> None:
-    if pending_count is None:
-        pending_count = _count_rows(pending_df)
-    if pending_count == 0:
-        return
-    log.info("streaming.interface: writing %s rows to pending enrichment", pending_count)
-    parked = pending_df.select(
-        F.col("payload").alias("raw_payload"),
-        F.col("source_topic"),
-        F.current_timestamp().alias("parked_at"),
-        F.col("device_id"),
-        F.lit(False).alias("enriched"),
-        F.lit(None).cast("timestamp").alias("enriched_at"),
-        F.lit(0).cast("int").alias("retry_count"),
-        F.to_date(F.current_timestamp()).alias("_partition_date"),
-    )
-    writer.write_dataframe(parked, SILVER_PENDING)
+def _write_pending(pending_df: DataFrame, writer: IcebergWriter) -> None:
+    log.info("streaming.interface: writing rows to pending enrichment")
+    parked = build_silver_pending(pending_df, raw_col="payload")
+    try:
+        with _iceberg_write_lock:
+            writer.write_dataframe(parked, SILVER_PENDING)
+    except Exception as e:
+        log.error("streaming.pending: write failed (continuing): %s", str(e)[:150])
 
 
 def _write_enriched_interface(
     enriched_df: DataFrame,
     writer: IcebergWriter,
-    enriched_count: int | None = None,
 ) -> None:
-    if enriched_count is None:
-        enriched_count = _count_rows(enriched_df)
-    if enriched_count == 0:
-        return
-    log.info("streaming.interface: writing %s enriched rows to silver interface table", enriched_count)
-    silver = enriched_df.select(
-        F.col("device_ts"),
-        F.col("_ingested_at").alias("ingested_ts"),
-        F.col("device_id"),
-        F.col("site_id"),
-        F.col("vendor"),
-        F.col("role"),
-        F.col("interface_name"),
-        F.col("effective_util_in"),
-        F.col("effective_util_out"),
-        F.col("util_in").alias("raw_util_in"),
-        F.col("util_out").alias("raw_util_out"),
-        F.col("admin_status"),
-        F.col("oper_status"),
-        F.map_from_arrays(F.array().cast("array<string>"), F.array().cast("array<string>")).alias(
-            "extra_cols"
-        ),
-        F.col("ingest_flags"),
-        F.col("ingest_z_score"),
-        F.col("ingest_iqr_score"),
-        F.col("ingest_anomaly"),
-        F.col("_partition_date"),
-    )
-    writer.write_dataframe(silver, SILVER_INTERFACE_STATS)
+    log.info("streaming.interface: writing enriched rows to silver interface table")
+    # Use the shared silver schema projection from silver_transforms to ensure consistency
+    silver = build_silver_interface(enriched_df)
+    try:
+        with _iceberg_write_lock:
+            writer.write_dataframe(silver, SILVER_INTERFACE_STATS)
+    except Exception as e:
+        log.error("streaming.interface: write failed (continuing): %s", str(e)[:150])
 
 
 
@@ -349,71 +319,36 @@ def _process_interface_batch(batch_df: DataFrame, _: int, spark, writer: Iceberg
 
     _ensure_baseline_fresh(ch)
 
-    input_count = _count_rows(batch_df)
-    log.info("streaming.interface: micro-batch received rows=%s", input_count)
-    _debug(f"interface micro-batch rows={input_count}")
+    log.info("streaming.interface: micro-batch received")
+    _debug("interface micro-batch received")
     inventory_latest = _get_inventory_df(spark)
     invalid, pending, enriched = _split_interface_records(batch_df, inventory_latest)
     enriched = _apply_ingest_scores(enriched, spark)
-    invalid = invalid.persist()
-    pending = pending.persist()
-    enriched = enriched.persist()
-
-    invalid_count = _count_rows(invalid)
-    pending_count = _count_rows(pending)
-    enriched_count = _count_rows(enriched)
-    log.info(
-        "streaming.interface: split invalid=%s pending=%s enriched=%s",
-        invalid_count,
-        pending_count,
-        enriched_count,
-    )
-    _write_dlq(invalid, writer, invalid_count)
-    _write_pending(pending, writer, pending_count)
-    _write_enriched_interface(enriched, writer, enriched_count)
-    # Flatline detection and health-score aggregation are NOT computed here.
-    # A micro-batch covers only ~30 s of data — window aggregations over 1 h / 4 h
-    # need historical context that doesn't exist in a single batch.
-    # Both are handled by scheduled batch jobs reading from silver.interface_stats.
-
-    invalid.unpersist()
-    pending.unpersist()
-    enriched.unpersist()
-
+    _write_dlq(invalid, writer)
+    _write_pending(pending, writer)
+    _write_enriched_interface(enriched, writer)
 
 def _process_syslog_batch(batch_df: DataFrame, _: int, spark, writer: IcebergWriter) -> None:
     if batch_df.isEmpty():
         log.info("streaming.syslogs: empty micro-batch")
         _debug("syslog micro-batch empty")
         return
-    log.info("streaming.syslogs: micro-batch received rows=%s", _count_rows(batch_df))
+    log.info("streaming.syslogs: micro-batch received")
     _debug("syslog micro-batch received")
     inventory_latest = _get_inventory_df(spark)
     staged = batch_df.join(inventory_latest, on="device_id", how="left")
     with_reason = staged.withColumn("validation_reason", syslogs_validation_reason())
     invalid = with_reason.filter(F.col("validation_reason").isNotNull())
-    invalid_count = _count_rows(invalid)
-    _write_dlq(invalid, writer, invalid_count)
+    _write_dlq(invalid, writer)
 
     clean = with_reason.filter(F.col("validation_reason").isNull() & F.col("site_id").isNotNull())
-    clean_count = _count_rows(clean)
-    if clean_count == 0:
-        log.info("streaming.syslogs: no clean rows to write")
-        return
-    log.info("streaming.syslogs: writing clean rows=%s", clean_count)
-    silver = clean.select(
-        F.col("device_ts"),
-        F.col("_ingested_at").alias("ingested_ts"),
-        F.col("device_id"),
-        F.col("site_id"),
-        F.col("vendor"),
-        F.col("role"),
-        F.col("severity"),
-        F.col("is_critical"),
-        F.col("message"),
-        F.col("_partition_date"),
-    )
-    writer.write_dataframe(silver, SILVER_SYSLOGS)
+    log.info("streaming.syslogs: writing clean rows")
+    silver = build_silver_syslogs(clean)
+    try:
+        with _iceberg_write_lock:
+            writer.write_dataframe(silver, SILVER_SYSLOGS)
+    except Exception as e:
+        log.error("streaming.syslogs: write failed (continuing): %s", str(e)[:150])
 
 
 def _replay_pending_from_inventory(inventory_batch: DataFrame, _: int, spark, writer: IcebergWriter) -> None:
@@ -455,11 +390,15 @@ def _replay_pending_from_inventory(inventory_batch: DataFrame, _: int, spark, wr
             F.col("raw_payload"),
             F.from_json(
                 F.col("raw_payload"),
-                "ts string, device_id string, interface_name string, util_in double, util_out double, admin_status int, oper_status int",
+                "ts string, device_id string, interface_name string, util_in string, util_out string, admin_status string, oper_status string",
             ).alias("r"),
             "site_id", "vendor", "role",
         )
         .select("raw_payload", "site_id", "vendor", "role", "r.*")
+        .withColumn("util_in", F.col("util_in").cast("double"))
+        .withColumn("util_out", F.col("util_out").cast("double"))
+        .withColumn("admin_status", F.col("admin_status").cast("int"))
+        .withColumn("oper_status", F.col("oper_status").cast("int"))
     )
 
     enriched = (
@@ -475,20 +414,28 @@ def _replay_pending_from_inventory(inventory_batch: DataFrame, _: int, spark, wr
     # baseline so late-enriched silver rows carry accurate ingest_* annotations.
     enriched = _apply_ingest_scores(enriched, spark)
 
-    replayed_count = enriched.count()
-    log.info("streaming.inventory: replaying %s pending rows for device_ids=%s", replayed_count, new_device_ids)
-    _write_enriched_interface(enriched, writer, replayed_count)
+    log.info("streaming.inventory: replaying pending rows for device_ids=%s", new_device_ids)
+    _write_enriched_interface(enriched, writer)
 
     # 5. Mark resolved rows as enriched so the batch safety-net job skips them.
+    # Use snapshot isolation so concurrent appends to pending_enrichment by the
+    # interface stream don't conflict with this MERGE DELETE.
     enriched.select("raw_payload", "device_id").createOrReplaceTempView("_resolved_pending")
-    spark.sql(f"""
-        MERGE INTO {SILVER_PENDING} AS t
-        USING _resolved_pending AS s
-            ON  t.raw_payload = s.raw_payload
-            AND t.device_id   = s.device_id
-            AND t.enriched    = false
-        WHEN MATCHED THEN DELETE 
-    """)
+    try:
+        spark.conf.set("spark.sql.iceberg.merge.isolation-level", "snapshot")
+        spark.sql(f"""
+            MERGE INTO {SILVER_PENDING} AS t
+            USING _resolved_pending AS s
+                ON  t.raw_payload = s.raw_payload
+                AND t.device_id   = s.device_id
+                AND t.enriched    = false
+            WHEN MATCHED THEN DELETE
+        """)
+    except Exception as e:
+        log.warning(
+            "streaming.inventory: MERGE on pending_enrichment failed (concurrent write), "
+            "rows will be cleaned by batch safety-net: %s", str(e)[:150]
+        )
 
 
 def run() -> None:

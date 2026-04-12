@@ -18,14 +18,14 @@ with DAG(
     catchup=False,
     tags=["network-health", "weekly"],
 ) as dag:
-    if_train = BashOperator(
+    isolation_forest_train = BashOperator(
         task_id="isolation_forest_train",
-        bash_command="python -m src.pipeline.batch",
+        bash_command="python -m src.pipeline.isolation_forest_train",
     )
 
-    psi_drift = BashOperator(
-        task_id="psi_drift",
-        bash_command="python -m src.pipeline.batch",
+    psi_drift_detect = BashOperator(
+        task_id="psi_drift_detect",
+        bash_command="python -m src.pipeline.psi_drift_detect",
     )
 
-    if_train >> psi_drift
+    isolation_forest_train >> psi_drift_detect

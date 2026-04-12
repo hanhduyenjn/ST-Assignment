@@ -15,6 +15,7 @@ dependencies = []
 
 [project.optional-dependencies]
 core = [
+    "numpy<2",
     "kafka-python==2.0.2",
     "pyspark==3.5.8",
     "pyiceberg[s3]==0.7.1",
@@ -44,8 +45,8 @@ iceberg-init = [
 ]
 
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest==8.2.2",
     "pytest-cov==5.0.0",
     "ruff==0.4.9",
