@@ -176,7 +176,7 @@ Streaming jobs can lag or fail. The `nightly_batch_dag` runs four sequential
 tasks that recover anything missed:
 
 **Handle Orphaned Records By Parking for Late Enrichment**
-![alt text](image-5.png)
+![alt text](image/image-5.png)
 I don't immediately route orphaned records to DLQ, because they may be enriched later when the inventory record arrives. Instead, I park them in `silver.pending_enrichment` and trigger a replay for that `device_id` when a new inventory record arrives. This gives late-arriving inventory a chance to enrich prior orphaned records without waiting for the nightly batch job.
 
 1. `dlq_reprocess` — promotes quarantined records whose `device_id` has since
