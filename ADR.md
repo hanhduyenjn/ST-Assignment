@@ -190,15 +190,12 @@ I don't immediately route orphaned records to DLQ, because they may be enriched 
 **Batch anomaly scoring (`batch.py`):**
 The backfill job loads baseline params from ClickHouse at job start and calls
 `apply_ingest_scores()` — the same function used by streaming — so backfilled
-silver rows carry accurate ingest_z_score, ingest_iqr_score, and ingest_flags.
-Falls back to an empty baseline (only THRESHOLD_SATURATED can fire) if
-ClickHouse is unreachable.
+silver rows carry accurate ingest_flags.
 
 **Pending enrichment — event-driven first:**
 When a new inventory record arrives, the streaming job automatically re-processes
 `silver.pending_enrichment` records for that `device_id` (without waiting for
-nightly batch). Parsing and baseline-scoring are redone to ensure late-enriched
-records have accurate ingest_* annotations. The Airflow nightly `pending_enrichment`
+nightly batch). The Airflow nightly `pending_enrichment`
 task is a safety net for records that missed the event-driven replay.
 
 ---
@@ -206,8 +203,7 @@ task is a safety net for records that missed the event-driven replay.
 ## Decision 3 — Defensive Ingestion via ValidatorChain + DLQ
 
 Every record passes through a `ValidatorChain` before reaching the silver layer.
-Validators are implemented as native Spark column expressions — no UDFs — so
-they run at full partition-level parallelism.
+Validators are implemented as native Spark column expressions — no UDFs.
 
 **ValidatorChain:**
 
@@ -240,10 +236,6 @@ Chain stops on first failure and routes to DLQ with the reason code.
 The raw JSON `raw_payload` is always preserved in the DLQ table and never mutated.
 The DLQ is an Iceberg table itself — it supports time-travel and can be queried
 retroactively. All updates via Iceberg `MERGE INTO` are atomic and idempotent.
-
-**Metrics:** `dlq_records_total[topic, reason]` counter per rejection.
-AlertManager fires a `WARNING` if DLQ rate exceeds 5 % of ingested volume for
-more than two minutes.
 
 
 ---
@@ -372,30 +364,6 @@ silver = bronze_stats.join(inventory, on="device_id", how="left") \
     .withColumn("_partition_date", F.to_date("device_ts"))
 ```
 
-The gold recompute job ([src/pipeline/gold_recompute.py](src/pipeline/gold_recompute.py)) uses SparkSQL tumbling
-windows to produce hourly site health scores:
-
-```python
-hourly = (
-    silver.groupBy(
-        F.col("site_id"),
-        F.window("device_ts", "1 hour").alias("w"),
-    )
-    .agg(
-        F.avg("effective_util_in").alias("avg_util_in"),
-        F.avg(F.when(F.col("effective_util_in") > 80, 1.0)
-               .otherwise(0.0)).alias("pct_saturated"),
-        F.avg(F.when(F.col("oper_status") != 1, 1.0)
-               .otherwise(0.0)).alias("pct_down"),
-    )
-    .withColumn("health_score",
-        F.greatest(F.lit(0.0),
-            F.lit(100.0)
-            - F.col("pct_saturated") * 40.0
-            - F.col("pct_down") * 20.0))
-)
-```
-
 ### Scale Trade-offs
 
 | Decision | Trade-off |
@@ -427,7 +395,9 @@ hourly = (
 - Flatline: Welford online variance over all UP-interface rows in the micro-batch → `FLATLINE`
 - Refreshed every 30 minutes from ClickHouse
 
-**Dual baseline sources** (both write to `device_baseline_params`, tracked via distilled_rules.source):
+**Dual baseline sources** (both write to `device_baseline_params`):
+Refer to /docs/PSI_AND_IF.md if you want to learn more
+![alt text](image/image-9.png)
 
 1. **Isolation Forest** (`isolation_forest_train.py` — weekly batch):
    - Trains on 30 days confirmed-normal data (ingest_anomaly=false)
@@ -442,14 +412,10 @@ hourly = (
    - Detects capacity upgrades, traffic changes, firmware updates, seasonal shifts
    - Source: "psi_drift_detector"
 
-**Why dual sources (not three):**
-- ReplacingMergeTree (valid_from versioned) picks latest baseline automatically
+**Why dual sources:**
+- ReplacingMergeTree (valid_from versioned) picks latest baseline automatically (a baseline represent a device/hour/day of week entity)
 - IF provides statistically trained baseline; PSI ensures it adapts to real-world changes
-- Source field in distilled_rules enables audit trail and debugging
-- `mv_device_baseline_refresh` (formerly a third source) was dropped: it computed
-  `avg(effective_util_in)` from all silver data including anomalous periods, resulting
-  in zero-mean baselines for test devices where seeded values were the only truth signal.
-  Removing it prevents the MV from overwriting carefully seeded or IF-trained baselines.
+
 
 ### Anomaly Detection Split: Ingest-time vs Batch
 
@@ -475,17 +441,6 @@ The right split: **stateless per-record checks (Z-score, IQR, threshold) and
 lightweight variance checks (Welford flatline) in streaming; the heavier
 multivariate model in nightly batch** where the latency budget is hours, not seconds.
 
-### Why online learning (Half-Space Trees, RRCF) was rejected
-
-Online models consume each incoming record as a training update. In
-infrastructure monitoring, anomalous records — flatlines, spikes, DoS traffic
-— would be absorbed and the model would drift toward treating failures as
-normal. The worse the network gets, the blinder the detector becomes. This is
-**concept contamination**, not concept drift. Without labels, online learning
-cannot distinguish between the two. The decision mirrors production practice at
-Cloudflare, Netflix, and Datadog: controlled periodic retraining on a
-validated-normal corpus.
-
 ### Flatline Detection (Active — Welford Inline)
 
 Flatline detection is **active** and runs inside each `foreachBatch` callback of
@@ -495,31 +450,7 @@ Welford online variance algorithm from [src/transforms/flatline_v2.py](src/trans
 **Why not a separate Spark job with 4-hour tumbling windows:**
 - Tumbling-window append mode only emits after watermark passes the window end
   (08:00+ for a 4-hour window), so short test bursts (4 minutes) never emit.
-- Running two Spark JVMs on a laptop caused JVM SIGSEGV (G1GC OOM crashes).
-- The approach is over-engineered for the PoC scale.
-
-**Active implementation** ([src/pipeline/streaming.py](src/pipeline/streaming.py)):
-
-```python
-# Driver-side, per micro-batch — no UDF, no second Spark job
-def _get_flatline_keys(enriched_df):
-    rows = enriched_df.filter(col("oper_status") == 1)
-                      .select("device_id", "interface_name", "effective_util_in")
-                      .collect()
-    # Group by (device_id, interface_name), run Welford variance on values
-    # Returns set of (device_id, interface_name) pairs where variance < eps
-    ...
-
-def _apply_flatline_flags(enriched_df, flatline_keys):
-    # Broadcast-join flatline keys back to mark each matching row:
-    #   ingest_flags = array_union(ingest_flags, ["FLATLINE"])
-    #   ingest_anomaly = True
-    ...
-```
-
-Both the normal enrichment path (`_process_interface_batch`) and the inventory
-replay path (`_replay_pending_from_inventory`) call these functions so flatline
-detection applies regardless of whether inventory was cached at arrival time.
+- Running two Spark JVMs on my laptop caused JVM SIGSEGV (G1GC OOM crashes) :(.
 
 **Configuration** (environment variables):
 - `FLATLINE_VARIANCE_THRESHOLD` (default: `0.01`) — max variance to classify as flatline
@@ -540,29 +471,12 @@ commented out.
 **Weekly cycle:**
 1. Streaming writes `ingest_z_score`, `ingest_iqr_score`, `ingest_flags` per record
 2. Isolation Forest trains on confirmed-normal silver rows (ingest_anomaly=false)
-3. Creates baselines → syncs to ClickHouse
+3. Creates new baselines → syncs to ClickHouse
 4. PSI Drift Detector validates baselines, updates if PSI > 0.25
 5. Streaming next micro-batch reloads baselines (TTL 30 min)
 6. Self-correcting loop closes — no manual redeploys needed
 
-**Training corpus:** Always on confirmed-normal data (ingest_anomaly=false) to prevent model drift toward treating failures as normal. Source tracking in ClickHouse shows which algorithm produced each baseline (isolation_forest vs psi_drift_detector).
-
-**Why train only on confirmed-normal data:**
-Training on all data silently includes degraded periods, causing the model to learn that failures are normal. By excluding both ingest-time anomalies and prior batch flags, the training corpus stays clean regardless of how degraded the network becomes.
-
-**Model promotion safeguards:**
-Before a newly trained Isolation Forest replaces the production model:
-
-1. Candidate is scored on a held-out validation window (most recent 7 days of
-   confirmed-normal silver).
-2. Precision and recall computed against the current model on the same window.
-3. Candidate promoted **only if it matches or improves both metrics**.
-4. If it underperforms: current model retained, `model_retrain_rejected_total`
-   Prometheus counter incremented, AlertManager fires for engineer review.
-5. PSI > 0.25 (genuine concept drift — device replacement, firmware update)
-   requires human sign-off before the new distribution is accepted as baseline.
-6. Every promotion decision is logged to MinIO (version-pinned by Airflow `run_id`)
-   for full audit trail.
+**Training corpus:** Always on confirmed-normal data (ingest_anomaly=false) to prevent model drift toward treating failures as normal. Training on all data silently includes degraded periods, causing the model to learn that failures are normal.
 
 ---
 
@@ -571,6 +485,7 @@ Before a newly trained Isolation Forest replaces the production model:
 Three pillars run fully on-premises:
 
 **Prometheus metrics ([src/monitoring/metrics.py](src/monitoring/metrics.py)):**
+Not yet fully implemented
 
 ```
 records_ingested_total{source, topic}      Counter
@@ -586,6 +501,7 @@ site_health_score{site_id}                 Gauge      # latest score
 ```
 
 **AlertManager rules:**
+Not yet fully implemented
 
 | Alert | Threshold | Severity |
 |-------|-----------|----------|
@@ -597,10 +513,7 @@ site_health_score{site_id}                 Gauge      # latest score
 | ModelRetrainingRejected | model_retrain_rejected increase > 0 in 1h | warning |
 
 **Grafana dashboards** (query ClickHouse gold tables):
-1. `pipeline.json` — Kafka lag, throughput, DLQ breakdown, latency per stage
-2. `data_quality.json` — quarantine reasons, false-positive rate, reprocessing success
-3. `anomaly.json` — anomalies per site from `gold_anomaly_flags`, health scores per site from `gold_site_health_hourly`
-4. `health.json` — site hourly health scores from `gold_site_health_hourly` (SummingMergeTree), trends & degradation alerts
+Only `health.json` — site hourly health scores from `gold_site_health_hourly` (SummingMergeTree), trends & degradation alerts is working now.
 
 ---
 

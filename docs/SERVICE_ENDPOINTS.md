@@ -14,7 +14,7 @@ All services are running on `localhost` with the following ports and health chec
   ```bash
   # Check running topics
   docker exec kafka kafka-topics --bootstrap-server localhost:29092 --list
-  
+
   # Check message count
   docker exec kafka kafka-run-class kafka.tools.GetOffsetShell \
     --bootstrap-server localhost:29092 --topic raw.interface.stats
@@ -37,7 +37,7 @@ All services are running on `localhost` with the following ports and health chec
   ```bash
   # Check MinIO is accessible
   curl -f http://localhost:9001/minio/health/live
-  
+
   # List buckets (requires mc CLI)
   docker exec minio mc ls local/
   ```
@@ -45,8 +45,6 @@ All services are running on `localhost` with the following ports and health chec
   - ✅ Bucket `lakehouse/` - Main data lake
   - ✅ Subdirectory `lakehouse/bronze/` - Bronze layer data
   - ✅ Subdirectory `lakehouse/silver/` - Silver layer data
-  - ✅ Subdirectory `lakehouse/checkpoints/` - Spark checkpoints
-  - ✅ Subdirectory `lakehouse/models/` - ML models
 
 ### Iceberg REST Catalog
 - **URL**: http://localhost:8181
@@ -55,10 +53,10 @@ All services are running on `localhost` with the following ports and health chec
   ```bash
   # Check catalog config
   curl http://localhost:8181/v1/config
-  
+
   # List namespaces
   curl http://localhost:8181/v1/namespaces
-  
+
   # Check bronze tables
   curl http://localhost:8181/v1/namespaces/bronze/tables
   ```
@@ -78,7 +76,7 @@ All services are running on `localhost` with the following ports and health chec
   ```bash
   # Check if ClickHouse is responding
   curl http://localhost:8123/ping
-  
+
   # Query via clickhouse-client
   docker exec -it clickhouse clickhouse-client -q "SELECT 1"
   ```
@@ -89,7 +87,6 @@ All services are running on `localhost` with the following ports and health chec
   - ✅ **Silver Layer**:
     - `silver_interface_stats_src` - Interface statistics
     - `silver_syslogs_src` - System logs
-    - `silver_anomaly_flags` - Detected anomalies
   - ✅ **Gold Layer**:
     - `gold_site_health_hourly` - Hourly aggregations
     - `gold_anomaly_flags` - Final anomaly flags
@@ -100,7 +97,7 @@ All services are running on `localhost` with the following ports and health chec
   ```bash
   # Check API health
   curl http://localhost:8000/health
-  
+
   # Check metrics
   curl http://localhost:8000/metrics | grep anomaly
   ```
@@ -184,11 +181,6 @@ All services are running on `localhost` with the following ports and health chec
   # Check Spark master is responding
   curl http://localhost:8080/
   ```
-- **What to Monitor**:
-  - ✅ Active applications
-  - ✅ Executor health
-  - ✅ Memory usage
-  - ✅ Job completion rates
 
 ### Spark Worker
 - **UI**: http://localhost:8081
@@ -196,6 +188,13 @@ All services are running on `localhost` with the following ports and health chec
   ```bash
   # Check worker is healthy
   curl http://localhost:8081/
+  ```
+## Spark Local for Streaming 
+- **UI**: http://localhost:4040
+- **Health Check**:
+  ```bash
+  # Check if it is healthy
+  curl http://localhost:4040/
   ```
 
 ---
