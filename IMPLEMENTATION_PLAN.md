@@ -88,12 +88,13 @@ on-premises data platform. No internet connectivity. Open-source only.
        │ Spark reads                          │ Spark reads
        ▼                                      ▼
 ┌──────────────────────┐          ┌──────────────────────────────┐
-│  SPARK BATCH         │          │  SPARK STRUCTURED STREAMING  │
-│  Bronze ingest job   │          │  Single app · single DAG     │
-│  raw → bronze/       │          │  Stage 1: validate + DLQ     │
-│  (Iceberg)           │          │  Stage 2: enrich             │
-└──────────────────────┘          │  Stage 3a: health score      │
-                                  │  Stage 3b: flatline detect   │
+│  SPARK STRUCTURED    │          │  SPARK STRUCTURED STREAMING  │
+│  STREAMING           │          │  Single app · single DAG     │
+│  Bronze ingest job   │          │  Stage 1: validate + DLQ     │
+│  raw → bronze/       │          │  Stage 2: enrich (or park    │
+│  slow trigger · self-│          │    to pending_enrichment)    │
+│  managing offsets    │          │  Stage 3a: health score      │
+└──────────────────────┘          │  Stage 3b: flatline detect   │
                                   │  → writes silver/ (Iceberg)  │
                                   └──────────────┬───────────────┘
                                                  │
@@ -111,7 +112,7 @@ on-premises data platform. No internet connectivity. Open-source only.
 │  Iceberg engine      │    │  FastAPI bridge     │
 │  MV → Gold tables    │    │  → Grafana JSON DS  │
 │  gold_site_health    │    └─────────────────────┘
-│  gold_anomaly_flags  │
+│  gold_anomaly_flags  |
 │  device_baseline_    │
 │  params              │
 └──────┬───────────────┘
@@ -122,12 +123,15 @@ on-premises data platform. No internet connectivity. Open-source only.
 │  Pipeline dashboard · Data quality dashboard · Anomaly dashboard│
 └─────────────────────────────────────────────────────────────────┘
 
-SPARK BATCH (nightly scheduled)
-  · DLQ reprocessor      reads dlq_quarantine → re-validates → silver
-  · Isolation Forest     reads silver (30d) → gold_anomaly_flags (ClickHouse)
-  · Tree distillation    trains shallow decision tree → streaming rules
-  · Backfill job         bronze → silver (Challenge 1 SparkSQL window fns)
-  · PSI drift job        weekly · updates device_baseline_params
+SPARK BATCH (Airflow-orchestrated)
+  · DLQ reprocessor        nightly · reads dlq_quarantine → re-validates → silver
+  · Pending enrichment     event-driven (streaming trigger) + nightly Airflow safety net
+  ·                        parks unenrichable records → re-enriches when inventory arrives
+  · Gold recompute         nightly · after pending enrichment · Spark batch window fns
+  · Isolation Forest train weekly · train on confirmed-normal Silver (30d)
+  · Isolation Forest detect nightly · score last 24h → gold_anomaly_flags (ClickHouse)
+  · PSI drift job          weekly · depends on 30d Silver · updates device_baseline_params
+  · Backfill job           on-demand · bronze → silver (Challenge 1 SparkSQL window fns)
 ```
 
 ---
@@ -149,6 +153,7 @@ SPARK BATCH (nightly scheduled)
 | ML — batch | scikit-learn IsolationForest | Unsupervised; no labels needed; joblib/ONNX export |
 | ML — distillation | scikit-learn DecisionTreeClassifier | Distills forest into streaming rules |
 | ML — retraining gate | Held-out validation window | Candidate model only promoted if it outperforms current; prevents contaminated retraining |
+| Batch job scheduler | Apache Airflow | Cron-based DAG orchestration for DLQ reprocessor, pending enrichment, gold recompute, model train/detect, PSI drift; UI for monitoring and manual triggers |
 | Feature store (future) | ScyllaDB | Device behavioral embeddings; low-latency streaming lookup |
 | Container | Docker Compose | On-premises, no Kubernetes required for PoC |
 
@@ -193,14 +198,18 @@ Stage 2 — Enrich (in-memory, no Kafka hop)
              → Kafka output.anomaly-alerts (real-time Prometheus consumption)
 ```
 
-### 4.2 Bronze Ingest Path (Spark batch, replaces Kafka Connect)
+### 4.2 Bronze Ingest Path (Spark Structured Streaming, always-on)
+
+Runs as a long-lived Spark Structured Streaming application separate from the main
+pipeline. Uses a slow trigger (`processingTime("1 minute")`). Offsets are
+self-managed via Spark checkpoint — no Airflow orchestration needed.
 
 ```
 Kafka raw topics
-    │ Spark reads via read (batch, offset-based)
-    │ Scheduled every 15 minutes (or triggered)
+    │ Spark reads via readStream (streaming, checkpoint-managed offsets)
+    │ Slow trigger: processingTime("1 minute")
     ▼
-BronzeIngestJob
+BronzeIngestJob (streaming)
     │ No transformation — raw payload preserved exactly
     │ Add _ingested_at, _source_topic metadata columns
     │ Write to bronze/ partitioned by _source_topic / date
@@ -208,37 +217,65 @@ BronzeIngestJob
 Iceberg bronze/ tables (append-only, permanent retention)
 ```
 
-### 4.3 Batch Path (nightly, post-processing)
+### 4.3 Batch Path (nightly / weekly, orchestrated by Airflow)
+
+All jobs triggered by Airflow DAGs using `SparkSubmitOperator` or `BashOperator`.
 
 ```
 silver/interface_stats (Iceberg, last 30 days)
     │
-    ├──▶ IsolationForestDetector.train()  [weekly]
+    ├──▶ DLQReprocessor  [nightly — Airflow DAG: nightly_batch_dag, step 1]
+    │        read dlq_quarantine where reprocessed=false
+    │        classify: fixable (orphaned device now in inventory) vs permanent
+    │        fixable → re-run ValidatorChain → promote to silver
+    │        permanent → set reprocessed=true, quarantine_resolution=PERMANENT
+    │
+    ├──▶ PendingEnrichmentJob  [event-driven from streaming (minutes latency) + Airflow safety net]
+    │        Primary path (event-driven, minutes latency):
+    │            streaming pipeline parks unenrichable records to
+    │            silver.pending_enrichment when validation passes but
+    │            inventory join fails (device not yet known)
+    │            when new inventory record arrives on raw.inventory topic,
+    │            streaming pipeline immediately re-attempts enrichment for
+    │            all pending records matching that device_id → writes to silver
+    │        Safety net: Airflow nightly_batch_dag step 2 sweeps any records
+    │            that event-driven path missed:
+    │            read silver.pending_enrichment where enriched=false
+    │            re-attempt inventory join — if device_id now in bronze/inventory:
+    │                apply full enrichment → write to silver.interface_stats
+    │                mark enriched=true
+    │            else: leave pending, increment retry_count
+    │
+    ├──▶ GoldRecomputeJob  [nightly — Airflow DAG: nightly_batch_dag, step 3]
+    │        Runs after PendingEnrichmentJob (Airflow task dependency)
+    │        Reads silver records written or updated in last run window
+    │        SparkSQL window functions: recompute health scores for affected hours
+    │        Upsert results to ClickHouse gold_site_health_hourly
+    │        Ensures late-arriving enriched records are reflected in Gold
+    │
+    ├──▶ IsolationForestDetector.train()  [weekly — Airflow DAG: weekly_batch_dag]
     │        compute feature vectors (10 features per device+interface window)
     │        fit IsolationForest(n_estimators=100, contamination=0.05)
     │        distill → DecisionTreeClassifier(max_depth=4) → streaming rules
     │        persist model + scaler + rules to MinIO
     │        update device_baseline_params in ClickHouse
     │
-    ├──▶ IsolationForestDetector.detect()  [nightly]
+    ├──▶ IsolationForestDetector.detect()  [nightly — Airflow DAG: nightly_batch_dag, step 4]
+    │        depends on model artifact from weekly train job
     │        load model from MinIO
     │        compute feature vectors on last 24h
     │        score + classify subtype (FLAPPING, LOW_VARIANCE, RAPID_DRIFT, ...)
     │        → ClickHouse gold_anomaly_flags (anomaly_type=MODEL)
     │
-    ├──▶ PSIDriftDetector  [weekly]
+    ├──▶ PSIDriftDetector  [weekly — Airflow DAG: weekly_batch_dag]
+    │        depends on 30 days of complete Silver being available
     │        compute PSI per device per metric vs 30-day baseline
     │        PSI > 0.25 → significant drift
     │        update device_baseline_params (new q1, q3, iqr_k)
     │        streaming job auto-adapts on next micro-batch
     │
-    ├──▶ DLQReprocessor  [nightly]
-    │        read dlq_quarantine where reprocessed=false
-    │        classify: fixable (orphaned device now in inventory) vs permanent
-    │        fixable → re-run ValidatorChain → promote to silver
-    │        permanent → set reprocessed=true, quarantine_resolution=PERMANENT
-    │
-    └──▶ BackfillJob  [on-demand, Challenge 1]
+    └──▶ BackfillJob  [on-demand, Challenge 1 — Airflow DAG: backfill_dag]
+             triggered manually or on schedule
              read bronze/interface_stats
              SparkSQL window functions for health score aggregation
              partitioned writes to silver + ClickHouse Gold tables
@@ -394,6 +431,27 @@ Partition spec: `days(_partition_date)`
 
 ---
 
+#### `silver.pending_enrichment`
+Written by the main streaming pipeline when a record passes validation but the
+inventory join fails (device_id not yet in `bronze.inventory`). Enriched by the
+event-driven path in streaming (on new inventory arrival) or by the nightly Airflow
+safety net sweep.
+
+| Column | Type | Notes |
+|---|---|---|
+| `raw_payload` | string | original validated record, never mutated |
+| `source_topic` | string | |
+| `parked_at` | timestamp | when the streaming pipeline parked the record |
+| `device_id` | string | the unresolvable device_id at park time |
+| `enriched` | boolean | default false; set true on successful enrichment |
+| `enriched_at` | timestamp | nullable |
+| `retry_count` | int | incremented by nightly safety net on each failed attempt |
+| `_partition_date` | date | |
+
+Partition spec: `days(_partition_date)`
+
+---
+
 ### 5.2 ClickHouse Tables (Gold Layer + Parameters)
 
 #### `gold_site_health_hourly`
@@ -451,7 +509,6 @@ Written by nightly batch jobs. Read by streaming job as broadcast join.
 | `baseline_mean` | Float32 | 30-day rolling mean |
 | `baseline_std` | Float32 | 30-day rolling std |
 | `iqr_k` | Float32 | IQR fence multiplier (typically 1.5) |
-| `ewma_alpha` | Float32 | fit from autocorrelation |
 | `isolation_score_threshold` | Float32 | 95th pct of normal scores |
 | `distilled_rules` | String | JSON-encoded decision tree rules |
 | `valid_from` | DateTime | |
@@ -493,13 +550,10 @@ network-health-poc/
 ├── src/
 │   ├── __init__.py
 │   │
-│   ├── consumers/                     # pluggable source layer
-│   │   ├── __init__.py
-│   │   ├── base.py                    # SourceConsumer ABC
-│   │   ├── csv_consumer.py            # polls CSV → Kafka
-│   │   ├── jsonl_consumer.py          # polls JSONL → Kafka
-│   │   ├── mqtt_consumer.py           # stub — MQTT swap-in
-│   │   └── registry.py               # config-driven: "csv" → CsvConsumer
+│   ├── producers/                     # data source → Kafka layer
+│   │   ├── generate.py                # fake data generator (anomaly injection)
+│   │   └── producer_kafka.py          # BaseProducer + per-source producers
+│   │                                  # reads CSV/JSONL files → Kafka topics
 │   │
 │   ├── validators/                    # validator chain
 │   │   ├── __init__.py
@@ -523,9 +577,13 @@ network-health-poc/
 │   │
 │   ├── pipeline/                      # Spark jobs
 │   │   ├── __init__.py
-│   │   ├── streaming.py               # single Spark Structured Streaming app
+│   │   ├── streaming.py               # main Spark Structured Streaming app
 │   │   │                              # stage1 → stage2 → stage3a + stage3b
-│   │   ├── bronze_ingest.py           # Spark batch: Kafka → bronze Iceberg
+│   │   │                              # also handles event-driven pending enrichment
+│   │   ├── bronze_ingest.py           # Spark Structured Streaming: Kafka → bronze Iceberg
+│   │   │                              # always-on · slow trigger · self-managing offsets
+│   │   ├── pending_enrichment.py      # Airflow safety net sweep: pending → silver
+│   │   ├── gold_recompute.py          # Spark batch: recompute gold for enriched windows
 │   │   ├── batch.py                   # SparkSQL window fns — Challenge 1
 │   │   │                              # backfill bronze → silver
 │   │   └── dlq_reprocessor.py         # reads DLQ → re-validates → silver
@@ -575,6 +633,7 @@ network-health-poc/
 │           ├── silver_interface_stats.sql
 │           ├── silver_syslogs.sql
 │           ├── silver_anomaly_flags.sql
+│           ├── silver_pending_enrichment.sql
 │           └── silver_dlq_quarantine.sql
 │
 ├── config/
@@ -599,24 +658,20 @@ network-health-poc/
 
 ## 7. Design Patterns
 
-### 7.1 Strategy Pattern — Source Consumers
+### 7.1 Strategy Pattern — Kafka Producers
 
-Every data source implements `SourceConsumer` ABC. The pipeline never knows what
-the source is — it only calls `poll()` and receives `RawRecord` objects.
+Every data source has a dedicated producer class inheriting `BaseProducer`.
+The pipeline never knows the source format — it only reads from Kafka topics.
 
 ```
-SourceConsumer (ABC)
-    ├── CsvConsumer        poll() tails CSV file rows
-    ├── JsonlConsumer      poll() tails JSONL file lines
-    └── MqttConsumer       poll() subscribes to MQTT broker topic (stub)
-
-SourceRegistry             maps config string → consumer class
-                           "csv"  → CsvConsumer
-                           "jsonl" → JsonlConsumer
-                           "mqtt" → MqttConsumer
+BaseProducer
+    ├── InterfaceStatsProducer   reads interface_stats.csv → raw.interface.stats
+    ├── SyslogsProducer          reads syslogs.jsonl       → raw.syslogs
+    └── InventoryProducer        reads device_inventory.csv → raw.inventory
 ```
 
-Swap production: change one config line. Zero pipeline change.
+Swap production: replace the file-reading loop in each producer with an MQTT/API
+subscription. Zero pipeline change — Kafka topic contract is unchanged.
 
 ---
 
@@ -702,38 +757,35 @@ PROMETHEUS_PORT
 
 ## 8. Component Specifications
 
-### 8.1 Source Consumers
+### 8.1 Kafka Producers
 
-**`SourceConsumer` ABC:**
-- `poll(batch_size: int) -> Iterator[RawRecord]`
-- `source_type() -> str`
-- `topic() -> str` — Kafka topic to produce to
+**`BaseProducer` (`producers/producer_kafka.py`):**
+- Wraps `KafkaProducer` with `key_serializer` and `value_serializer` (UTF-8 encoded)
+- `produce(key, value)` — sends one record to the configured topic
+- `terminate()` — flushes and closes the producer
 
-**`RawRecord` dataclass:**
-```python
-@dataclass
-class RawRecord:
-    payload: dict[str, Any]     # raw parsed record
-    source_type: str            # "csv", "jsonl", "mqtt"
-    received_at: datetime       # consumer receipt time
-    raw_string: str             # original string for DLQ preservation
-```
+**`InterfaceStatsProducer`:**
+- Reads `data/interface_stats.csv` row by row with `csv.DictReader`
+- Produces each row as JSON to `raw.interface.stats` keyed by `device_id`
+- Flushes every 50 messages with a random sleep to simulate realistic arrival rate
 
-**`CsvConsumer`:**
-- Reads CSV with `pandas.read_csv` using `chunksize` for memory efficiency
-- Required columns validated on first read — extra columns passed through
-- Tracks last read offset (line number) — stateful across poll() calls
-- Produces to `raw.interface-stats` or `raw.inventory` based on config
+**`SyslogsProducer`:**
+- Reads `data/syslogs.jsonl` line by line
+- Produces each line to `raw.syslogs` keyed by `device_id`
 
-**`JsonlConsumer`:**
-- Reads JSONL line by line using file seek position
-- Each line parsed as JSON — parse error → skip + log, never crash
-- Produces to `raw.syslogs`
+**`InventoryProducer`:**
+- Reads `data/device_inventory.csv` row by row
+- Produces each row as JSON to `raw.inventory` keyed by `device_id`
 
-**`MqttConsumer` (stub):**
-- Implements ABC with `NotImplementedError` on `poll()`
-- Documents the MQTT topic subscription pattern for production
-- Zero changes to pipeline when implemented
+All three producers run in parallel as separate `multiprocessing.Process` instances
+(see `producer_kafka.py __main__`).
+
+**`generate.py` — Fake data generator:**
+- `generate_data(n, anomaly)` appends `n` records to each data file
+- `AnomalyConfig` controls anomaly injection rate and type: `missing_field`,
+  `extra_field`, `wrong_type`, `out_of_range`, `null_value`, `schema_change`
+- Presets: `NO_ANOMALY`, `LOW_ANOMALY` (10%), `HIGH_ANOMALY` (50%)
+- Pydantic models in `common/schema.py` define the canonical shape per source
 
 ---
 
@@ -830,12 +882,35 @@ enriched interface-stats stream
 
 ### 8.4 Spark Batch Jobs
 
-**`pipeline/bronze_ingest.py` — BronzeIngestJob:**
-- Reads Kafka raw topics using `spark.read.format("kafka")` with offset tracking
-- Writes raw payloads to bronze/ Iceberg tables — no transformation
+**`pipeline/bronze_ingest.py` — BronzeIngestJob (Spark Structured Streaming):**
+- Runs as always-on Spark Structured Streaming application, separate from the main pipeline
+- Reads Kafka raw topics using `spark.readStream.format("kafka")`
+- Slow trigger: `processingTime("1 minute")` — archival cadence, not operational latency
+- Offsets are self-managed via Spark checkpoint at `s3a://lakehouse/checkpoints/bronze/`
+- No transformation — raw payload preserved exactly as received
 - Adds `_ingested_at`, `_source_topic` metadata columns
-- Runs on schedule: every 15 minutes
-- Idempotent: Iceberg ACID prevents duplicate writes on rerun
+- Writes to bronze/ Iceberg tables (append-only) — Iceberg ACID prevents duplicate writes on rerun
+- No Airflow dependency — starts with Docker Compose, recovers from failure via checkpoint
+
+**`pipeline/pending_enrichment.py` — PendingEnrichmentJob:**
+- Primary path is event-driven and runs within the streaming pipeline:
+  - When the main streaming pipeline receives a new inventory record on `raw.inventory`,
+    it immediately re-attempts enrichment for all `silver.pending_enrichment` records
+    matching that `device_id` — achieves minutes latency without a separate job
+  - Enriched records are written to `silver.interface_stats`; pending record marked `enriched = true`
+- Airflow safety net (`nightly_batch_dag` step 2): sweeps any records the event-driven path missed
+  - Reads `silver.pending_enrichment` where `enriched = false`
+  - Re-attempts inventory join against latest `bronze.inventory` snapshot
+  - Success: apply full enrichment → write to `silver.interface_stats` → mark `enriched = true`
+  - Still-unresolvable: increment `retry_count`; after N retries promote to DLQ as `ORPHANED_DEVICE`
+- Idempotent: guarded by Iceberg MERGE INTO on `silver.pending_enrichment`
+
+**`pipeline/gold_recompute.py` — GoldRecomputeJob:**
+- Runs after `PendingEnrichmentJob` — Airflow task dependency enforced in `nightly_batch_dag`
+- Identifies all `(site_id, window_start)` hour buckets touched by records enriched in the current Airflow run
+- Recomputes health scores for affected windows using SparkSQL window functions (same logic as BackfillJob)
+- Upserts to ClickHouse `gold_site_health_hourly` via `ReplacingMergeTree` upsert semantics
+- Ensures late-arriving records (promoted via pending enrichment sweep) are reflected in Gold
 
 **`pipeline/batch.py` — BackfillJob (Challenge 1):**
 - Reads `bronze.interface_stats` with `site_id` + date range filter
@@ -880,6 +955,18 @@ ensures Iceberg scans only relevant files — no full table scan.
   - `NEGATIVE_UTIL`, `EXCEEDS_MAX`, `NULL_FIELD` → permanent
 - Fixable records: re-run ValidatorChain → write to silver → mark `reprocessed=true`, `resolution=PROMOTED_TO_SILVER`
 - Permanent records: mark `reprocessed=true`, `resolution=PERMANENT`
+
+**Airflow DAGs (`dags/`):**
+
+| DAG | Schedule | Jobs triggered (sequential, task-dependent) |
+|---|---|---|
+| `nightly_batch_dag` | `0 2 * * *` (02:00 daily) | DLQ reprocessor → pending enrichment sweep → gold recompute → IsolationForest detect |
+| `weekly_batch_dag` | `0 3 * * 0` (03:00 Sunday) | IsolationForest train → PSI drift detector (sequential; PSI depends on 30d Silver being complete) |
+| `backfill_dag` | Manual trigger or on-demand schedule | `pipeline/batch.py` with configurable `site_id` + date range |
+
+Bronze ingest has no Airflow DAG — it runs as an always-on Spark Structured Streaming job managed by Docker Compose. Pending enrichment event-driven path runs inside the main streaming pipeline; Airflow only provides the nightly safety net sweep.
+
+Each Airflow DAG uses `SparkSubmitOperator` pointing at `spark://spark-master:7077`. Jobs within a DAG are sequential — later tasks have explicit upstream dependencies. The Airflow scheduler and webserver run as separate containers sharing the `./dags` directory (mounted read-only).
 
 ---
 
@@ -1283,6 +1370,10 @@ is_degraded = health_score < 40
 | `alertmanager` | `prom/alertmanager` | Alert routing |
 | `spark-master` | `bitnami/spark` | Spark master |
 | `spark-worker` | `bitnami/spark` | Spark worker(s) |
+| `postgres` | `postgres:16` | Airflow metadata DB (LocalExecutor backend) |
+| `airflow-init` | `apache/airflow:2.9.1` | One-shot: DB migration + admin user creation |
+| `airflow-scheduler` | `apache/airflow:2.9.1` | Parses DAGs, triggers runs on schedule |
+| `airflow-webserver` | `apache/airflow:2.9.1` | UI on port 8085; DAG monitoring + manual triggers |
 
 All services on a single Docker network `network-health-net`.
 MinIO bucket `lakehouse` created on startup via `mc` init container.
@@ -1315,11 +1406,8 @@ ClickHouse DDL applied on startup via init SQL files mounted at `/docker-entrypo
 | `common/config.py` | All env var config, Pydantic Settings | nothing |
 | `common/spark_session.py` | SparkSession factory per mode | config |
 | `common/logging.py` | Structured JSON logging setup | nothing |
-| `consumers/base.py` | SourceConsumer ABC, RawRecord | nothing |
-| `consumers/csv_consumer.py` | CSV file tail → Kafka | base, config |
-| `consumers/jsonl_consumer.py` | JSONL file tail → Kafka | base, config |
-| `consumers/mqtt_consumer.py` | MQTT stub | base |
-| `consumers/registry.py` | Map config string → consumer class | all consumers |
+| `producers/generate.py` | Fake data generator with anomaly injection | common/config |
+| `producers/producer_kafka.py` | BaseProducer + per-source producers; reads files → Kafka | common/config |
 | `validators/base.py` | Validator ABC, ValidationResult | nothing |
 | `validators/rules.py` | All five validator implementations | base |
 | `validators/chain.py` | ValidatorChain composition | base, rules |
@@ -1331,9 +1419,14 @@ ClickHouse DDL applied on startup via init SQL files mounted at `/docker-entrypo
 | `models/isolation_forest.py` | Batch train on confirmed-normal data + gated promotion + detect + distill | base, storage/clickhouse_writer |
 | `models/psi_drift_detector.py` | Weekly PSI, param update | base, storage/clickhouse_writer |
 | `pipeline/streaming.py` | Main streaming app, all 3 stages | validators, transforms, models, storage |
-| `pipeline/bronze_ingest.py` | Spark batch: Kafka → bronze Iceberg | storage/iceberg_writer, catalog |
+| `pipeline/bronze_ingest.py` | Spark Structured Streaming: Kafka → bronze Iceberg (always-on, slow trigger) | storage/iceberg_writer, catalog |
+| `pipeline/pending_enrichment.py` | Airflow safety net: silver.pending_enrichment → silver.interface_stats | validators, storage, catalog |
+| `pipeline/gold_recompute.py` | Spark batch: recompute gold health scores for enriched windows | storage/clickhouse_writer, catalog |
 | `pipeline/batch.py` | SparkSQL backfill, window fns | storage, catalog |
 | `pipeline/dlq_reprocessor.py` | DLQ classify → promote → mark | validators, storage |
+| `dags/nightly_batch_dag.py` | Airflow DAG: nightly DLQ → pending enrichment sweep → gold recompute → IF detect | SparkSubmitOperator |
+| `dags/weekly_batch_dag.py` | Airflow DAG: weekly IF train → PSI drift | SparkSubmitOperator |
+| `dags/backfill_dag.py` | Airflow DAG: manual/on-demand backfill trigger | SparkSubmitOperator, Params |
 | `storage/base.py` | StorageWriter ABC | nothing |
 | `storage/iceberg_writer.py` | All Iceberg table writes | base, catalog |
 | `storage/clickhouse_writer.py` | ClickHouse inserts | config |
@@ -1354,53 +1447,56 @@ Write code in this exact sequence. Each layer depends only on layers above it.
 2. common/logging.py                  # structured logging
 3. common/spark_session.py            # SparkSession factory
 
-4. consumers/base.py                  # RawRecord + SourceConsumer ABC
-5. consumers/csv_consumer.py
-6. consumers/jsonl_consumer.py
-7. consumers/mqtt_consumer.py         # stub only
-8. consumers/registry.py
+4. producers/generate.py              # fake data generator (already exists)
+5. producers/producer_kafka.py        # Kafka producers (already exists)
 
-9. validators/base.py                 # Validator ABC + ValidationResult
-10. validators/rules.py               # all five rules
-11. validators/chain.py               # ValidatorChain
+6. validators/base.py                 # Validator ABC + ValidationResult
+7. validators/rules.py                # all five rules
+8. validators/chain.py                # ValidatorChain
 
-12. transforms/effective_util.py      # pure functions — no deps
-13. transforms/health_score.py
-14. transforms/flatline.py            # Welford algorithm
+9. transforms/effective_util.py       # pure functions — no deps
+10. transforms/health_score.py
+11. transforms/flatline.py            # Welford algorithm
 
-15. models/base.py                    # AnomalyDetector ABC + AnomalyResult
-16. models/flatline_detector.py       # streaming flatline
-17. models/isolation_forest.py        # batch model + distillation
-18. models/psi_drift_detector.py      # drift detection
+12. models/base.py                    # AnomalyDetector ABC + AnomalyResult
+13. models/flatline_detector.py       # streaming flatline
+14. models/isolation_forest.py        # batch model + distillation
+15. models/psi_drift_detector.py      # drift detection
 
-19. catalog/rest_catalog.py           # Iceberg REST Catalog connection
-20. storage/base.py                   # StorageWriter ABC
-21. storage/iceberg_writer.py         # Iceberg writes
-22. storage/clickhouse_writer.py      # ClickHouse writes
+16. catalog/rest_catalog.py           # Iceberg REST Catalog connection
+17. storage/base.py                   # StorageWriter ABC
+18. storage/iceberg_writer.py         # Iceberg writes
+19. storage/clickhouse_writer.py      # ClickHouse writes
 
-23. pipeline/bronze_ingest.py         # Kafka → bronze (Spark batch)
-24. pipeline/streaming.py             # main streaming app
-25. pipeline/batch.py                 # backfill + SparkSQL window fns
-26. pipeline/dlq_reprocessor.py       # DLQ reprocessing
+23. pipeline/bronze_ingest.py         # Kafka → bronze (Spark Structured Streaming, always-on)
+24. pipeline/streaming.py             # main streaming app (stages 1–3 + event-driven pending enrichment)
+25. pipeline/pending_enrichment.py    # Airflow safety net: pending → silver
+26. pipeline/gold_recompute.py        # Spark batch: recompute gold for enriched windows
+27. pipeline/batch.py                 # backfill + SparkSQL window fns
+28. pipeline/dlq_reprocessor.py       # DLQ reprocessing
 
-27. query/duckdb_engine.py
-28. query/fastapi_bridge.py
+29. dags/nightly_batch_dag.py         # Airflow: nightly DLQ → pending enrichment → gold recompute → IF detect
+30. dags/weekly_batch_dag.py          # Airflow: weekly IF train → PSI drift
+31. dags/backfill_dag.py              # Airflow: manual/on-demand backfill trigger
 
-29. monitoring/metrics.py
-30. monitoring/exporter.py
+32. query/duckdb_engine.py
+33. query/fastapi_bridge.py
 
-31. sql/iceberg/ddl/*.sql             # table definitions
-32. sql/clickhouse/ddl/*.sql          # Gold table DDL
-33. sql/clickhouse/views/*.sql        # materialized views
+34. monitoring/metrics.py
+35. monitoring/exporter.py
 
-34. config/prometheus.yml
-35. config/alerting_rules.yml
-36. config/grafana/datasources/*.yml
-37. config/grafana/dashboards/*.json
+36. sql/iceberg/ddl/*.sql             # table definitions (includes silver_pending_enrichment.sql)
+37. sql/clickhouse/ddl/*.sql          # Gold table DDL
+38. sql/clickhouse/views/*.sql        # materialized views
 
-38. docker-compose.yml                # wire everything together
-39. main.py                           # CLI entrypoint
-40. README.md                         # ADR
+39. config/prometheus.yml
+40. config/alerting_rules.yml
+41. config/grafana/datasources/*.yml
+42. config/grafana/dashboards/*.json
+
+43. docker-compose.yml                # wire everything together
+44. main.py                           # CLI entrypoint
+45. README.md                         # ADR
 ```
 
 ---

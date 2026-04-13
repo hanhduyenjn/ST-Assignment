@@ -1,7 +1,7 @@
 {
   "title": "Data Quality Dashboard",
   "uid": "data-quality",
-  "version": 1,
+  "version": 3,
   "schemaVersion": 38,
   "refresh": "1m",
   "time": { "from": "now-24h", "to": "now" },
@@ -12,11 +12,10 @@
       "title": "DLQ Breakdown by Reason",
       "type": "piechart",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "uid": "prometheus" },
+      "datasource": { "uid": "clickhouse" },
       "targets": [
         {
-          "expr": "sum by (reason) (increase(dlq_records_total[24h]))",
-          "legendFormat": "{{reason}}"
+          "rawSql": "SELECT reason, cnt FROM (SELECT ifNull(quarantine_reason, 'UNKNOWN') AS reason, count() AS cnt FROM network_health.silver_dlq_quarantine_src WHERE quarantined_at >= now() - INTERVAL 24 HOUR GROUP BY reason UNION ALL SELECT 'NO_DQ_EVENTS' AS reason, 0 AS cnt) ORDER BY cnt DESC"
         }
       ]
     },
@@ -25,11 +24,10 @@
       "title": "Orphan Rate (ORPHANED_DEVICE as % of DLQ)",
       "type": "stat",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "uid": "prometheus" },
+      "datasource": { "uid": "clickhouse" },
       "targets": [
         {
-          "expr": "increase(dlq_records_total{reason=\"ORPHANED_DEVICE\"}[24h]) / (increase(dlq_records_total[24h]) + 1) * 100",
-          "legendFormat": "Orphan %"
+          "rawSql": "SELECT toFloat64(countIf(quarantine_reason = 'ORPHANED_DEVICE')) / greatest(toFloat64(count()), 1.0) * 100 AS orphan_rate_pct FROM network_health.silver_dlq_quarantine_src WHERE quarantined_at >= now() - INTERVAL 24 HOUR"
         }
       ],
       "fieldConfig": { "defaults": { "unit": "percent" } }
@@ -42,8 +40,7 @@
       "datasource": { "uid": "clickhouse" },
       "targets": [
         {
-          "rawSql": "SELECT toStartOfHour(validated_at) AS time, countIf(agreement = 'CONFIRMED') / count() * 100 AS agreement_pct FROM network_health.anomaly_validation GROUP BY time ORDER BY time",
-          "format": "time_series"
+          "rawSql": "SELECT time, agreement_pct FROM (SELECT toStartOfHour(validated_at) AS time, countIf(agreement = 'CONFIRMED') / greatest(toFloat64(count()), 1.0) * 100 AS agreement_pct FROM network_health.anomaly_validation WHERE validated_at >= now() - INTERVAL 24 HOUR GROUP BY time UNION ALL SELECT toStartOfHour(now()) AS time, 0.0 AS agreement_pct) ORDER BY time"
         }
       ],
       "fieldConfig": { "defaults": { "unit": "percent" } }
@@ -56,8 +53,20 @@
       "datasource": { "uid": "clickhouse" },
       "targets": [
         {
-          "rawSql": "SELECT countIf(quarantine_resolution = 'PROMOTED_TO_SILVER') / countIf(reprocessed = 1) * 100 AS reprocess_success_pct FROM network_health.silver_dlq_quarantine",
-          "format": "table"
+          "rawSql": "SELECT toFloat64(countIf(quarantine_resolution = 'PROMOTED_TO_SILVER')) / greatest(toFloat64(countIf(reprocessed = 1)), 1.0) * 100 AS reprocess_success_pct FROM network_health.silver_dlq_quarantine_src"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "id": 5,
+      "title": "False Positive Rate (24h)",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT toFloat64(countIf(agreement = 'FALSE_POSITIVE')) / greatest(toFloat64(count()), 1.0) * 100 AS false_positive_pct FROM network_health.anomaly_validation WHERE validated_at >= now() - INTERVAL 24 HOUR"
         }
       ],
       "fieldConfig": { "defaults": { "unit": "percent" } }

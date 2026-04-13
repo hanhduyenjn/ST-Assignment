@@ -1,22 +1,46 @@
 {
   "title": "Anomaly Dashboard",
   "uid": "anomaly",
-  "version": 1,
+  "version": 4,
   "schemaVersion": 38,
   "refresh": "30s",
-  "time": { "from": "now-6h", "to": "now" },
+  "time": { "from": "now-24h", "to": "now" },
   "tags": ["network-health", "anomaly"],
   "panels": [
     {
       "id": 1,
-      "title": "Site Health Score (latest)",
-      "type": "gauge",
+      "title": "Anomalies per Site (5m buckets)",
+      "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "uid": "prometheus" },
+      "datasource": { "uid": "clickhouse" },
       "targets": [
         {
-          "expr": "site_health_score",
-          "legendFormat": "{{site_id}}"
+          "rawSql": "SELECT toStartOfInterval(detected_at, INTERVAL 5 MINUTE) AS time, site_id AS metric, count() AS value FROM network_health.gold_anomaly_flags FINAL WHERE detected_at >= now() - INTERVAL 7 DAY GROUP BY time, metric ORDER BY time, metric"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Health Score per Site (hourly)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT window_start AS time, site_id AS metric, avg(health_score) AS value FROM network_health.gold_site_health_hourly FINAL WHERE window_start >= now() - INTERVAL 48 HOUR GROUP BY time, metric ORDER BY time, metric"
+        }
+      ],
+      "fieldConfig": { "defaults": { "min": 0, "max": 100 } }
+    },
+    {
+      "id": 3,
+      "title": "Latest Site Health Score",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT site_id, argMax(health_score, window_start) AS health_score FROM network_health.gold_site_health_hourly FINAL WHERE window_start >= now() - INTERVAL 48 HOUR GROUP BY site_id ORDER BY site_id"
         }
       ],
       "fieldConfig": {
@@ -34,32 +58,6 @@
       }
     },
     {
-      "id": 2,
-      "title": "Flatline Events per Site",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "uid": "prometheus" },
-      "targets": [
-        {
-          "expr": "increase(flatline_events_total[5m])",
-          "legendFormat": "{{site_id}}"
-        }
-      ]
-    },
-    {
-      "id": 3,
-      "title": "Model Anomaly Flags by Subtype",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "uid": "prometheus" },
-      "targets": [
-        {
-          "expr": "increase(model_anomaly_flags_total[5m])",
-          "legendFormat": "{{subtype}}"
-        }
-      ]
-    },
-    {
       "id": 4,
       "title": "Anomaly Flags — Recent (ClickHouse)",
       "type": "table",
@@ -67,21 +65,19 @@
       "datasource": { "uid": "clickhouse" },
       "targets": [
         {
-          "rawSql": "SELECT device_id, site_id, interface_name, anomaly_type, anomaly_subtype, score, detected_at FROM network_health.gold_anomaly_flags ORDER BY detected_at DESC LIMIT 50",
-          "format": "table"
+          "rawSql": "SELECT device_id, site_id, interface_name, anomaly_type, anomaly_subtype, score, detected_at FROM network_health.gold_anomaly_flags FINAL ORDER BY detected_at DESC LIMIT 50"
         }
       ]
     },
     {
       "id": 5,
-      "title": "Site Health Score Heatmap (hourly, last 24h)",
+      "title": "Degraded Site Windows (last 24h)",
       "type": "table",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
       "datasource": { "uid": "clickhouse" },
       "targets": [
         {
-          "rawSql": "SELECT site_id, window_start, health_score, is_degraded FROM network_health.gold_site_health_hourly WHERE window_start >= now() - INTERVAL 24 HOUR ORDER BY site_id, window_start",
-          "format": "table"
+          "rawSql": "SELECT site_id, window_start, health_score, is_degraded, pct_interfaces_saturated, pct_interfaces_down, critical_syslog_count FROM network_health.gold_site_health_hourly FINAL WHERE window_start >= now() - INTERVAL 24 HOUR AND is_degraded = 1 ORDER BY window_start DESC, site_id"
         }
       ]
     }

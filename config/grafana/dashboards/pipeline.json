@@ -1,76 +1,240 @@
 {
-  "title": "Pipeline Dashboard",
+  "title": "Pipeline Dashboard — Phase 7 Metrics",
   "uid": "pipeline",
-  "version": 1,
+  "version": 4,
   "schemaVersion": 38,
   "refresh": "30s",
-  "time": { "from": "now-3h", "to": "now" },
-  "tags": ["network-health", "pipeline"],
+  "time": { "from": "now-24h", "to": "now" },
+  "tags": ["network-health", "pipeline", "prometheus", "phase-7"],
   "panels": [
     {
       "id": 1,
-      "title": "Records Ingested / sec",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "title": "Prometheus Up",
+      "type": "stat",
+      "gridPos": { "h": 7, "w": 6, "x": 0, "y": 0 },
       "datasource": { "uid": "prometheus" },
       "targets": [
         {
-          "expr": "rate(records_ingested_total[1m])",
-          "legendFormat": "{{source}} / {{topic}}"
-        }
-      ]
-    },
-    {
-      "id": 2,
-      "title": "DLQ Rate (% of ingested)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "uid": "prometheus" },
-      "targets": [
-        {
-          "expr": "rate(dlq_records_total[1m]) / (rate(records_validated_total[1m]) + 1) * 100",
-          "legendFormat": "DLQ %"
+          "expr": "max(up)",
+          "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "percent",
+          "min": 0,
+          "max": 1,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "DOWN", "color": "red" },
+                "1": { "text": "UP", "color": "green" }
+              }
+            }
+          ],
           "thresholds": {
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 3 },
-              { "color": "red", "value": 5 }
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
             ]
           }
         }
       }
     },
     {
-      "id": 3,
-      "title": "Kafka Consumer Lag",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 2,
+      "title": "ingest_records_total (sum)",
+      "type": "stat",
+      "gridPos": { "h": 7, "w": 6, "x": 6, "y": 0 },
       "datasource": { "uid": "prometheus" },
       "targets": [
         {
-          "expr": "kafka_consumer_lag",
-          "legendFormat": "{{topic}} / partition {{partition}}"
+          "expr": "sum(ingest_records_total)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "dlq_records_total (sum)",
+      "type": "stat",
+      "gridPos": { "h": 7, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(dlq_records_total)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "anomalies_total (sum)",
+      "type": "stat",
+      "gridPos": { "h": 7, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(anomalies_total)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Ingest Rate by Topic/Status",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (topic, status) (rate(ingest_records_total[1m]))",
+          "refId": "A",
+          "legendFormat": "{{ topic }} {{ status }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Anomaly Rate by Type",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (anomaly_type) (rate(anomalies_total[1m]))",
+          "refId": "A",
+          "legendFormat": "{{ anomaly_type }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Latest Site Health Score by Site",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "latest_site_health_score",
+          "refId": "A",
+          "legendFormat": "{{ site_id }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 100,
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 40 },
+              { "color": "green", "value": 70 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Health Score Summary (min/max/avg)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "min(latest_site_health_score)",
+          "refId": "A",
+          "legendFormat": "min"
+        },
+        {
+          "expr": "max(latest_site_health_score)",
+          "refId": "B",
+          "legendFormat": "max"
+        },
+        {
+          "expr": "avg(latest_site_health_score)",
+          "refId": "C",
+          "legendFormat": "avg"
         }
       ]
     },
     {
-      "id": 4,
-      "title": "Pipeline Latency per Stage (p99)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 9,
+      "title": "stream_batch_duration_seconds_bucket Presence",
+      "type": "stat",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 23 },
       "datasource": { "uid": "prometheus" },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, rate(pipeline_latency_seconds_bucket[5m]))",
-          "legendFormat": "p99 {{stage}}"
+          "expr": "count(stream_batch_duration_seconds_bucket)",
+          "refId": "A"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "s" } }
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": { "text": "no data", "color": "red" }
+              }
+            }
+          ],
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "stream_batch_duration_seconds p99 by Stage",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 23 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, stage) (rate(stream_batch_duration_seconds_bucket[5m])))",
+          "refId": "A",
+          "legendFormat": "{{ stage }} p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
     }
   ]
 }

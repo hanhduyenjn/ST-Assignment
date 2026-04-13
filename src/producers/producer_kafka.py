@@ -8,11 +8,11 @@ import traceback
 from kafka import KafkaProducer
 
 from src.common.config import (
+    DATA_DIR,
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_TOPIC_INTERFACE_STATS,
-    KAFKA_TOPIC_SYSLOGS,
     KAFKA_TOPIC_INVENTORY,
-    DATA_DIR,
+    KAFKA_TOPIC_SYSLOGS,
 )
 
 ENCODING_FORMAT = "utf-8"
@@ -34,6 +34,9 @@ class BaseProducer:
 
     def produce(self, key, value):
         self.producer.send(self.topic, key=key, value=value)
+
+    def flush(self):
+        self.producer.flush()
 
     def terminate(self):
         self.producer.flush()
@@ -67,16 +70,39 @@ def produce_interface_stats():
 
         with open(DATA_DIR / "interface_stats.csv", "r") as f:
             reader = csv.DictReader(f)
-            for i, row in enumerate(reader, start=1):
-                producer.produce(key=row["device_id"], value=json.dumps(dict(row)))
-                _log(name, f"sent #{i} device_id={row['device_id']}")
+            rows = list(reader)
+        _log(name, f"loaded {len(rows)} records, starting continuous production")
+
+        known_fields = {"ts", "device_id", "interface_name", "util_in", "util_out", "admin_status", "oper_status"}
+
+        cycle = 0
+        while True:
+            cycle += 1
+            for i, row in enumerate(rows, start=1):
+                payload = {
+                    "ts": row["ts"],
+                    "device_id": row["device_id"],
+                    "interface_name": row["interface_name"],
+                    "util_in": float(row["util_in"]),
+                    "util_out": float(row["util_out"]),
+                    "admin_status": int(row["admin_status"]),
+                    "oper_status": int(row["oper_status"]),
+                }
+                for key, value in row.items():
+                    if key not in known_fields and value not in (None, ""):
+                        payload[key] = value
+                producer.produce(key=row["device_id"], value=json.dumps({
+                    **payload,
+                }))
                 if i % 50 == 0:
                     producer.producer.flush()
                     sleep_s = random.uniform(0.5, 2.0)
-                    _log(name, f"flushed {i} messages, sleeping {sleep_s:.2f}s")
+                    _log(name, f"[cycle {cycle}] flushed {i} messages, sleeping {sleep_s:.2f}s")
                     time.sleep(sleep_s)
-        producer.terminate()
-        _log(name, "all messages flushed and producer closed")
+            producer.producer.flush()
+            sleep_s = random.uniform(10, 30)
+            _log(name, f"[cycle {cycle}] completed all {len(rows)} records, sleeping {sleep_s:.2f}s")
+            time.sleep(sleep_s)
     except Exception:
         _log(name, "ERROR — traceback below")
         traceback.print_exc()
@@ -94,24 +120,24 @@ def produce_syslogs():
         _log(name, "connected")
 
         with open(DATA_DIR / "syslogs.jsonl", "r") as f:
-            lines = f.readlines()
-        _log(name, f"loaded {len(lines)} lines from syslogs.jsonl")
+            lines = [line.strip() for line in f.readlines() if line.strip()]
+        _log(name, f"loaded {len(lines)} records, starting continuous production")
 
-        for i, line in enumerate(lines, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            producer.produce(key=record["device_id"], value=line)
-            _log(name, f"sent #{i} device_id={record['device_id']}")
-            if i % 50 == 0:
-                producer.producer.flush()
-                sleep_s = random.uniform(0.5, 2.0)
-                _log(name, f"flushed {i} messages, sleeping {sleep_s:.2f}s")
-                time.sleep(sleep_s)
-
-        producer.terminate()
-        _log(name, "all messages flushed and producer closed")
+        cycle = 0
+        while True:
+            cycle += 1
+            for i, line in enumerate(lines, start=1):
+                record = json.loads(line)
+                producer.produce(key=record["device_id"], value=line)
+                if i % 50 == 0:
+                    producer.producer.flush()
+                    sleep_s = random.uniform(0.5, 2.0)
+                    _log(name, f"[cycle {cycle}] flushed {i} messages, sleeping {sleep_s:.2f}s")
+                    time.sleep(sleep_s)
+            producer.producer.flush()
+            sleep_s = random.uniform(10, 30)
+            _log(name, f"[cycle {cycle}] completed all {len(lines)} records, sleeping {sleep_s:.2f}s")
+            time.sleep(sleep_s)
     except Exception:
         _log(name, "ERROR — traceback below")
         traceback.print_exc()
@@ -130,17 +156,31 @@ def produce_inventory():
 
         with open(DATA_DIR / "device_inventory.csv", "r") as f:
             reader = csv.DictReader(f)
-            for i, row in enumerate(reader, start=1):
+            rows = list(reader)
+        _log(name, f"loaded {len(rows)} records, starting continuous production")
+
+        cycle = 0
+        delay_cycle_freq = 5  # Every 5 cycles, delay inventory by 10-15 minutes
+        while True:
+            cycle += 1
+
+            # Occasionally delay inventory production (10-15 min) to test pending enrichment
+            if cycle % delay_cycle_freq == 0:
+                delay_s = random.uniform(600, 900)  # 10-15 minutes
+                _log(name, f"[cycle {cycle}] DELAYING inventory by {delay_s/60:.1f} minutes (pending enrichment test)")
+                time.sleep(delay_s)
+
+            for i, row in enumerate(rows, start=1):
                 producer.produce(key=row["device_id"], value=json.dumps(dict(row)))
-                _log(name, f"sent #{i} device_id={row['device_id']}")
                 if i % 50 == 0:
                     producer.producer.flush()
                     sleep_s = random.uniform(0.5, 2.0)
-                    _log(name, f"flushed {i} messages, sleeping {sleep_s:.2f}s")
+                    _log(name, f"[cycle {cycle}] flushed {i} messages, sleeping {sleep_s:.2f}s")
                     time.sleep(sleep_s)
-
-        producer.terminate()
-        _log(name, "all messages flushed and producer closed")
+            producer.producer.flush()
+            sleep_s = random.uniform(10, 30)
+            _log(name, f"[cycle {cycle}] completed all {len(rows)} records, sleeping {sleep_s:.2f}s")
+            time.sleep(sleep_s)
     except Exception:
         _log(name, "ERROR — traceback below")
         traceback.print_exc()

@@ -1,0 +1,37 @@
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-21-jre-headless \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java)))) && \
+    echo "export JAVA_HOME=$JAVA_HOME" >> /etc/profile.d/java.sh
+
+# Preload Iceberg + S3 runtime jars for Spark SQL catalog resolution.
+# Without these jars, init.py fails with ClassNotFound for
+# org.apache.iceberg.spark.SparkCatalog / IcebergSparkSessionExtensions.
+ENV SPARK_JARS_DIR=/opt/spark-jars
+RUN set -eux; \
+    mkdir -p "$SPARK_JARS_DIR"; \
+    base=https://repo1.maven.org/maven2; \
+    for coord in \
+        "org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.5.0/iceberg-spark-runtime-3.5_2.12-1.5.0.jar" \
+        "org/apache/iceberg/iceberg-aws-bundle/1.5.0/iceberg-aws-bundle-1.5.0.jar" \
+        "org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar" \
+        "com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar" \
+    ; do \
+        curl -fL --retry 3 --retry-delay 2 -o "$SPARK_JARS_DIR/$(basename "$coord")" "$base/$coord"; \
+    done
+
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY pyproject.toml uv.lock* ./
+RUN uv pip install --system ".[iceberg-init]"
+
+
+COPY ./src ./src
+COPY ./sql/iceberg/ddl ./sql/iceberg/ddl
+COPY ./sql/iceberg/ddl/init.py ./sql/iceberg/ddl/init.py
+
+CMD ["sh", "-c", "echo Ready"]
