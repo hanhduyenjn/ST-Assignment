@@ -15,6 +15,10 @@ http://localhost:8085       (admin/admin)
 http://localhost:3000       (admin/admin)
 ![alt text](image-7.png)
 
+### Kafka UI
+http://localhost:8082
+![alt text](image-8.png)
+
 ### Spark UI
 http://localhost:8080 (for batch jobs) or http://localhost:4040 (for streaming jobs)
 
@@ -601,6 +605,7 @@ site_health_score{site_id}                 Gauge      # latest score
 ---
 
 ## Validation Script Result: [scripts/validate_pipeline.sh](scripts/validate_pipeline.sh)
+```
 {13:18}~/ST-Assignment:feature/add-anomaly-dection ✗ ➭ ./scripts/validate_pipeline.sh
 ╔════════════════════════════════════════════════════════════════╗
 ║          Network Health Pipeline Validation Script             ║
@@ -703,6 +708,7 @@ Site degradation alerts (health_score < 40):
 ⚠     DC1: 17 windows, min=20 avg=20.1
 ⚠     SITE-C: 3 windows, min=20 avg=20
 ⚠     SITE-A: 15 windows, min=20 avg=23.4
+```
 
 ## Production Upgrade Path
 
