@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from pyspark.sql import functions as F
 
-from src.common.config import SAMPLE_FRACTION, SMOKE_MAX_ROWS
+from src.common.config import CLICKHOUSE_DB, CLICKHOUSE_HOST, CLICKHOUSE_PORT, SAMPLE_FRACTION, SMOKE_MAX_ROWS
 from src.common.logging import log
 from src.common.spark_session import SparkSessionFactory
-from src.pipeline.silver_transforms import build_silver_interface
+from src.pipeline.silver_transforms import apply_ingest_scores, build_silver_interface, empty_baseline_df
+from src.storage.clickhouse_writer import ClickHouseWriter
 from src.storage.iceberg_writer import IcebergWriter
 from src.transforms.effective_util import effective_util_expr
 
@@ -34,14 +35,25 @@ def run() -> None:
 
     inventory = spark.table("rest.bronze.inventory").select("device_id", "site_id", "vendor", "role")
 
-    # Join with inventory and add default scoring columns
-    enriched = (
-        bronze_stats.join(inventory, on="device_id", how="left")
-        .withColumn("ingest_z_score", F.lit(0.0))
-        .withColumn("ingest_iqr_score", F.lit(0.0))
-        .withColumn("ingest_anomaly", F.lit(False))
-        .withColumn("ingest_flags", F.array().cast("array<string>"))
-    )
+    enriched = bronze_stats.join(inventory, on="device_id", how="left")
+
+    # Load baseline params from ClickHouse so z-score / IQR flags are applied.
+    # Falls back to an empty baseline (only THRESHOLD_SATURATED can fire) if
+    # ClickHouse is unreachable or the table is empty.
+    try:
+        ch = ClickHouseWriter(host=CLICKHOUSE_HOST, port=CLICKHOUSE_PORT, database=CLICKHOUSE_DB)
+        baseline_rows = ch.fetch_baseline_params()
+        if baseline_rows:
+            baseline_df = spark.createDataFrame(baseline_rows)
+            log.info("batch: loaded %d baseline rows from ClickHouse", len(baseline_rows))
+        else:
+            log.warning("batch: device_baseline_params is empty — only THRESHOLD_SATURATED will fire")
+            baseline_df = empty_baseline_df(spark)
+    except Exception as exc:
+        log.warning("batch: could not load baseline params (%s) — only THRESHOLD_SATURATED will fire", exc)
+        baseline_df = empty_baseline_df(spark)
+
+    enriched = apply_ingest_scores(enriched, baseline_df)
 
     # Project to silver schema using the shared silver_transforms logic
     silver = build_silver_interface(enriched)

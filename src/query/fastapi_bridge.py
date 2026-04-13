@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
+from prometheus_client import make_asgi_app
 from pydantic import BaseModel
 
 from src.query.duckdb_engine import DuckDBEngine
@@ -13,6 +14,8 @@ class SQLQuery(BaseModel):
 def create_app() -> FastAPI:
     app = FastAPI(title="DuckDB Query Bridge", version="0.1.0")
     engine = DuckDBEngine()
+
+    app.mount("/metrics", make_asgi_app())
 
     @app.get("/health")
     def health() -> dict[str, str]:

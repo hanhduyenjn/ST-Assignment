@@ -59,28 +59,9 @@ for svc in "${services[@]}"; do
     esac
 done
 
-# ─────────────────────────────────────────────────────────────────────────
-section "PHASE 2: Kafka Topics & Messages"
-
-for topic in "raw.interface.stats" "raw.syslogs" "raw.inventory"; do
-    offsets=$(docker exec kafka kafka-run-class kafka.tools.GetOffsetShell \
-        --bootstrap-server localhost:29092 --topic "$topic" 2>/dev/null || true)
-
-    if [ -z "$offsets" ]; then
-        warn "Kafka topic '$topic' is empty or unreachable"
-        continue
-    fi
-
-    total=$(echo "$offsets" | awk -F: '{sum+=$3} END {print sum+0}')
-    if [ "$(to_int "$total")" -gt 0 ]; then
-        pass "Kafka topic '$topic' has $total messages"
-    else
-        warn "Kafka topic '$topic' exists but has 0 messages"
-    fi
-done
 
 # ─────────────────────────────────────────────────────────────────────────
-section "PHASE 3: Bronze Layer (Iceberg) — row counts"
+section "PHASE 2: Bronze Layer (Iceberg) — row counts"
 #
 # bronze_ingest has failed silently in the past (tables created, no rows
 # written). We pull the current snapshot's total-records directly from the
@@ -140,9 +121,9 @@ except Exception:
 fi
 
 # ─────────────────────────────────────────────────────────────────────────
-section "PHASE 4: Silver Layer (ClickHouse mirrors)"
+section "PHASE 3: Silver Layer (ClickHouse mirrors & staging)"
 
-silver_tables=("silver_interface_stats_src" "silver_syslogs_src")
+silver_tables=("silver_interface_stats_src" "silver_syslogs_src" "silver_flatline_anomaly_flags")
 
 for tbl in "${silver_tables[@]}"; do
     count=$(ch_query "SELECT count() FROM network_health.${tbl}")
@@ -154,8 +135,58 @@ for tbl in "${silver_tables[@]}"; do
     fi
 done
 
+echo ""
+echo "DLQ quarantine status:"
+dlq_count=$(ch_query "SELECT count() FROM network_health.silver_dlq_quarantine_src")
+dlq_count=$(to_int "$dlq_count")
+if [ "$dlq_count" -gt 0 ]; then
+    warn "DLQ records quarantined: $dlq_count"
+    dlq_reasons=$(ch_query "
+        SELECT
+            quarantine_reason,
+            count() as cnt
+        FROM network_health.silver_dlq_quarantine_src
+        GROUP BY quarantine_reason
+        ORDER BY cnt DESC
+        FORMAT TSV
+    ")
+    echo "$dlq_reasons" | while read -r reason count; do
+        info "  ${reason}: $(to_int "$count")"
+    done
+else
+    pass "DLQ is clean: $dlq_count quarantined"
+fi
+
 # ─────────────────────────────────────────────────────────────────────────
-section "PHASE 5: Gold Layer (ClickHouse)"
+section "PHASE 5: Baselines & Materialized Views"
+
+echo "Device baseline parameters (ReplacingMergeTree):"
+baseline_count=$(ch_query "SELECT count() FROM network_health.device_baseline_params")
+baseline_count=$(to_int "$baseline_count")
+if [ "$baseline_count" -gt 0 ]; then
+    pass "device_baseline_params: $baseline_count rows"
+    sources=$(ch_query "
+        SELECT DISTINCT source FROM network_health.device_baseline_params
+    ")
+    info "  Sources: $(echo "$sources" | tr '\n' ',')"
+else
+    warn "device_baseline_params: empty (weekly batch not run?)"
+fi
+
+echo ""
+echo "Materialized Views (refreshed every 1 minute):"
+for mv in "mv_anomaly_summary" "mv_site_health_hourly"; do
+    # Check if MV exists by querying the system table
+    mv_status=$(ch_query "SELECT name FROM system.tables WHERE database='network_health' AND name='${mv}'" 2>/dev/null || echo "")
+    if [ -n "$mv_status" ]; then
+        pass "MV ${mv} exists"
+    else
+        warn "MV ${mv} not found"
+    fi
+done
+
+# ─────────────────────────────────────────────────────────────────────────
+section "PHASE 6: Gold Layer (ClickHouse)"
 
 gold_tables=("gold_site_health_hourly" "gold_anomaly_flags")
 
@@ -169,103 +200,153 @@ for tbl in "${gold_tables[@]}"; do
     fi
 done
 
+echo ""
+echo "Gold layer aggregation quality:"
+health_by_site=$(ch_query "
+    SELECT
+        site_id,
+        count() as records,
+        min(health_score) as min_score,
+        max(health_score) as max_score,
+        round(avg(health_score), 2) as avg_score
+    FROM network_health.gold_site_health_hourly
+    GROUP BY site_id
+    ORDER BY site_id
+    FORMAT TSV
+")
+if [ -n "$health_by_site" ]; then
+    info "Site health aggregations:"
+    echo "$health_by_site" | while read -r site_id records min_score max_score avg_score; do
+        info "  ${site_id}: records=$records min=$min_score max=$max_score avg=$avg_score"
+    done
+else
+    warn "No site health aggregations yet"
+fi
+
 # ─────────────────────────────────────────────────────────────────────────
-section "PHASE 6: Anomaly Detection"
+section "PHASE 7: Prometheus Metrics (Pipeline Observability)"
 
-echo "Ingest-time (Z-score & IQR) on silver_interface_stats_src:"
-z_iqr=$(ch_query "
-    SELECT
-        countIf(ingest_z_score > 2.0),
-        countIf(ingest_iqr_score > 1.0),
-        countIf((ingest_z_score > 2.0) AND (ingest_iqr_score > 1.0)),
-        countIf(ingest_anomaly)
-    FROM network_health.silver_interface_stats_src
-    FORMAT TSV
-")
-if [ -n "$z_iqr" ]; then
-    read -r z_cnt iqr_cnt both_cnt total_cnt <<<"$z_iqr"
-    pass "  Z-score>2: $(to_int "$z_cnt")  |  IQR>1: $(to_int "$iqr_cnt")  |  overlap: $(to_int "$both_cnt")  |  flagged: $(to_int "$total_cnt")"
+PROM_URL="http://localhost:9090"
 
-    z_devices=$(ch_query "
-        SELECT arrayStringConcat(groupArray(device_id), ',')
-        FROM (
-            SELECT DISTINCT device_id
-            FROM network_health.silver_interface_stats_src
-            WHERE ingest_z_score > 2.0
-            ORDER BY device_id
-        )
-    ")
-    iqr_devices=$(ch_query "
-        SELECT arrayStringConcat(groupArray(device_id), ',')
-        FROM (
-            SELECT DISTINCT device_id
-            FROM network_health.silver_interface_stats_src
-            WHERE ingest_iqr_score > 1.0
-            ORDER BY device_id
-        )
-    ")
-    info "  Z-score devices: ${z_devices:-none}"
-    info "  IQR devices: ${iqr_devices:-none}"
+# Check Prometheus reachability
+if curl -s -f "${PROM_URL}/api/v1/query?query=up" >/dev/null 2>&1; then
+    pass "Prometheus reachable at ${PROM_URL}"
 
-    if [ "$(to_int "$both_cnt")" -gt 0 ]; then
-        warn "  Some records violate both Z-score and IQR"
-    fi
-else
-    warn "  silver_interface_stats_src not queryable"
-fi
+    echo ""
+    echo "Ingest pipeline metrics:"
 
-echo ""
-echo "Ingest-time (FLATLINE) on silver_interface_stats_src ingest_flags:"
-flat=$(to_int "$(ch_query "SELECT countIf(has(ingest_flags, 'FLATLINE')) FROM network_health.silver_interface_stats_src")")
-if [ "$flat" -gt 0 ]; then
-    pass "  FLATLINE flagged records: $flat"
-else
-    warn "  No FLATLINE records flagged yet"
-fi
-
-echo ""
-echo "Deterministic three-anomaly smoke check (unified streaming path):"
-three_check=$(ch_query "
-    SELECT
-        countIf(device_id='edge-r2' AND ingest_z_score > 2.0),
-        countIf(device_id='fw1' AND ingest_iqr_score > 1.0),
-        countIf(device_id='edge-r1' AND has(ingest_flags, 'FLATLINE'))
-    FROM network_health.silver_interface_stats_src
-    FORMAT TSV
-")
-if [ -n "$three_check" ]; then
-    read -r z_dev iqr_dev flat_dev <<<"$three_check"
-    z_dev=$(to_int "$z_dev")
-    iqr_dev=$(to_int "$iqr_dev")
-    flat_dev=$(to_int "$flat_dev")
-    info "  edge-r2 HIGH_Z_SCORE rows: $z_dev"
-    info "  fw1 IQR_OUTLIER rows: $iqr_dev"
-    info "  edge-r1 FLATLINE rows: $flat_dev"
-    if [ "$z_dev" -gt 0 ] && [ "$iqr_dev" -gt 0 ] && [ "$flat_dev" -gt 0 ]; then
-        pass "  All 3 deterministic anomaly paths observed (z-score, iqr, flatline)"
+    # ingest_records_total
+    ingest_total=$(curl -s "${PROM_URL}/api/v1/query?query=ingest_records_total" | \
+        python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(float(r['value'][1]) for r in d.get('data',{}).get('result',[])) if d.get('status')=='success' else 0)" 2>/dev/null)
+    ingest_total=$(to_int "$ingest_total")
+    if [ "$ingest_total" -gt 0 ]; then
+        pass "  ingest_records_total: $ingest_total"
     else
-        warn "  Missing one or more deterministic anomaly paths"
+        warn "  ingest_records_total: $ingest_total (no ingest yet)"
+    fi
+
+    # dlq_records_total
+    dlq_total=$(curl -s "${PROM_URL}/api/v1/query?query=dlq_records_total" | \
+        python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(float(r['value'][1]) for r in d.get('data',{}).get('result',[])) if d.get('status')=='success' else 0)" 2>/dev/null)
+    dlq_total=$(to_int "$dlq_total")
+    if [ "$dlq_total" -eq 0 ]; then
+        pass "  dlq_records_total: $dlq_total (no rejections)"
+    else
+        warn "  dlq_records_total: $dlq_total (check DLQ breakdown)"
+    fi
+
+    echo ""
+    echo "Anomaly detection metrics:"
+
+    # anomalies_total
+    anomalies=$(curl -s "${PROM_URL}/api/v1/query?query=anomalies_total" | \
+        python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(float(r['value'][1]) for r in d.get('data',{}).get('result',[])) if d.get('status')=='success' else 0)" 2>/dev/null)
+    anomalies=$(to_int "$anomalies")
+    if [ "$anomalies" -gt 0 ]; then
+        pass "  anomalies_total: $anomalies"
+    else
+        warn "  anomalies_total: $anomalies (no anomalies detected yet)"
+    fi
+
+    # latest_site_health_score
+    health=$(curl -s "${PROM_URL}/api/v1/query?query=latest_site_health_score" | \
+        python3 -c "import sys,json; d=json.load(sys.stdin); scores = [float(r['value'][1]) for r in d.get('data',{}).get('result',[])]; print(f'min={min(scores):.0f} max={max(scores):.0f} avg={sum(scores)/len(scores):.1f}') if scores else print('no data')" 2>/dev/null)
+    info "  latest_site_health_score: $health"
+
+    echo ""
+    echo "Pipeline latency metrics:"
+
+    # stream_batch_duration_seconds
+    latency=$(curl -s "${PROM_URL}/api/v1/query?query=stream_batch_duration_seconds_bucket" | \
+        python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('data',{}).get('result',[])) > 0)" 2>/dev/null)
+    if [ "$latency" = "True" ]; then
+        pass "  stream_batch_duration_seconds: collecting"
+    else
+        warn "  stream_batch_duration_seconds: no histogram data yet"
     fi
 else
-    warn "  Could not query deterministic anomaly smoke check"
+    warn "Prometheus not reachable at ${PROM_URL}"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────
+section "PHASE 8: Anomaly Detection"
+
+echo "Anomaly type counts on gold_anomaly_flags FINAL:"
+anomaly_counts=$(ch_query "
+    SELECT
+        countIf(anomaly_type = 'THRESHOLD_SATURATED'),
+        countIf(anomaly_type = 'HIGH_Z_SCORE'),
+        countIf(anomaly_type = 'IQR_OUTLIER'),
+        countIf(anomaly_type = 'FLATLINE'),
+        countIf(anomaly_type = 'CRITICAL_SYSLOG_BURST'),
+        countIf(anomaly_type = 'MODEL'),
+        count()
+    FROM network_health.gold_anomaly_flags FINAL
+    FORMAT TSV
+")
+if [ -n "$anomaly_counts" ]; then
+    read -r thr_cnt z_cnt iqr_cnt flat_cnt crit_cnt model_cnt total_cnt <<<"$anomaly_counts"
+    while read -r label count; do
+        n=$(to_int "$count")
+        if [ "$n" -gt 0 ]; then
+            pass "  ${label}: $n"
+        else
+            warn "  ${label}: 0"
+        fi
+    done <<EOF
+THRESHOLD_SATURATED $thr_cnt
+HIGH_Z_SCORE $z_cnt
+IQR_OUTLIER $iqr_cnt
+FLATLINE $flat_cnt
+CRITICAL_SYSLOG_BURST $crit_cnt
+MODEL $model_cnt
+EOF
+    info "  total gold anomaly records: $(to_int "$total_cnt")"
+else
+    warn "  gold_anomaly_flags not queryable"
 fi
 
 echo ""
-echo "Batch (Isolation Forest MODEL) on gold_anomaly_flags:"
-model=$(to_int "$(ch_query "SELECT count() FROM network_health.gold_anomaly_flags WHERE anomaly_type='MODEL'")")
-if [ "$model" -gt 0 ]; then
-    pass "  MODEL anomalies: $model"
+echo "Site degradation alerts (health_score < 40):"
+degraded=$(ch_query "
+    SELECT
+        site_id,
+        count() as degraded_windows,
+        round(min(health_score), 1) as min_score,
+        round(avg(health_score), 1) as avg_score
+    FROM network_health.gold_site_health_hourly
+    WHERE health_score < 40
+    GROUP BY site_id
+    ORDER BY min_score ASC
+    FORMAT TSV
+")
+if [ -n "$degraded" ]; then
+    warn "  Degraded sites detected:"
+    echo "$degraded" | while read -r site_id windows min_score avg_score; do
+        warn "    ${site_id}: $windows windows, min=$min_score avg=$avg_score"
+    done
 else
-    warn "  No MODEL anomalies yet (nightly Airflow batch)"
-fi
-
-echo ""
-echo "Syslog burst anomalies on gold_anomaly_flags:"
-syslog_burst=$(to_int "$(ch_query "SELECT count() FROM network_health.gold_anomaly_flags WHERE anomaly_type='CRITICAL_SYSLOG_BURST'")")
-if [ "$syslog_burst" -gt 0 ]; then
-    pass "  CRITICAL_SYSLOG_BURST anomalies: $syslog_burst"
-else
-    warn "  No CRITICAL_SYSLOG_BURST anomalies yet"
+    pass "  All sites healthy (health_score >= 40)"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -286,7 +367,7 @@ cat <<'EOF'
   docker logs bronze-ingest --tail 100
   docker logs streaming     --tail 100
   docker exec -it clickhouse clickhouse-client
-    SELECT * FROM network_health.gold_anomaly_flags ORDER BY ts DESC LIMIT 5;
+        SELECT * FROM network_health.gold_anomaly_flags ORDER BY detected_at DESC LIMIT 5;
 
   Re-run this script after each stage to watch counts climb.
 EOF

@@ -251,9 +251,10 @@ def seed_clickhouse_baseline():
 
     anomaly_start = datetime.utcnow().replace(microsecond=0) - timedelta(minutes=ANOMALY_LOOKBACK_MINUTES)
     hour_of_day = anomaly_start.hour
-    # Spark's dayofweek() uses 1=Sun..7=Sat; the streaming join maps with (dayofweek-1)%7.
-    # Seed the baseline with the same convention so the deterministic anomaly rows match.
-    day_of_week = (anomaly_start.weekday() + 1) % 7
+    # Streaming pipeline computes day_of_week as (spark_dayofweek + 5) % 7 where
+    # Spark's dayofweek() is 1=Sun..7=Sat.  Python's weekday() is 0=Mon..6=Sun,
+    # which maps identically: Mon→0, Tue→1, ..., Sun→6.
+    day_of_week = anomaly_start.weekday()
 
     client = clickhouse_connect.get_client(
         host=os.getenv("CLICKHOUSE_HOST", "localhost"),
@@ -263,22 +264,11 @@ def seed_clickhouse_baseline():
         database=os.getenv("CLICKHOUSE_DATABASE", "network_health"),
     )
 
+    # Always upsert: ReplacingMergeTree(valid_from) keeps the row with the latest
+    # valid_from, so using utcnow() here guarantees these test baselines win over
+    # any stale rows written by the baseline_refresh job.
     rows: list[dict[str, object]] = []
     for profile in TEST_PROFILES:
-        existing = client.query(
-            "SELECT count() FROM device_baseline_params WHERE device_id = %(device_id)s AND interface_name = %(interface_name)s AND hour_of_day = %(hour_of_day)s AND day_of_week = %(day_of_week)s",
-            parameters={
-                "device_id": profile["device_id"],
-                "interface_name": profile["interface_name"],
-                "hour_of_day": hour_of_day,
-                "day_of_week": day_of_week,
-            },
-        ).result_rows[0][0]
-
-        if existing:
-            print(f"✓ ClickHouse baseline already present for {profile['device_id']}/{profile['interface_name']} {hour_of_day}:{day_of_week}")
-            continue
-
         rows.append({
             "device_id": profile["device_id"],
             "interface_name": profile["interface_name"],
@@ -289,7 +279,7 @@ def seed_clickhouse_baseline():
             "iqr_k": profile["iqr_k"],
             "isolation_score_threshold": ANOMALY_ISOLATION_SCORE_THRESHOLD,
             "distilled_rules": "{}",
-            "valid_from": ANOMALY_VALID_FROM,
+            "valid_from": datetime.utcnow(),
             "valid_until": ANOMALY_VALID_UNTIL,
         })
 

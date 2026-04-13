@@ -124,7 +124,7 @@ def _consume_and_write(
         topic,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id=group_id,
-        auto_offset_reset="earliest",
+        auto_offset_reset="latest",
         enable_auto_commit=False,
         consumer_timeout_ms=CONSUMER_TIMEOUT_MS,
         max_poll_records=500,
@@ -275,7 +275,7 @@ def collect_raw_data():
             record_parser=_parse_inventory,
             run_id=str(ctx["run_id"]),
         )
-    
+
     collect_interface_stats()
     collect_syslogs()
     collect_inventory()

@@ -52,4 +52,4 @@ with DAG(
         append_env=True,
     )
 
-    dlq_reprocess >> pending_enrichment >> gold_recompute >> model_detect
+    dlq_reprocess >> pending_enrichment >> model_detect

@@ -1,72 +1,240 @@
 {
-  "title": "Pipeline Dashboard",
+  "title": "Pipeline Dashboard — Phase 7 Metrics",
   "uid": "pipeline",
-  "version": 2,
+  "version": 4,
   "schemaVersion": 38,
   "refresh": "30s",
   "time": { "from": "now-24h", "to": "now" },
-  "tags": ["network-health", "pipeline"],
+  "tags": ["network-health", "pipeline", "prometheus", "phase-7"],
   "panels": [
     {
       "id": 1,
-      "title": "Records Ingested / sec",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "uid": "clickhouse" },
+      "title": "Prometheus Up",
+      "type": "stat",
+      "gridPos": { "h": 7, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "uid": "prometheus" },
       "targets": [
         {
-          "rawSql": "SELECT toStartOfMinute(_ingested_at) AS time, 'silver_ingest' AS metric, count() / 60.0 AS value FROM network_health.silver_interface_stats_src WHERE _ingested_at >= now() - INTERVAL 24 HOUR GROUP BY time, metric ORDER BY time"
-        }
-      ]
-    },
-    {
-      "id": 2,
-      "title": "DLQ Rate (% of ingested)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "uid": "clickhouse" },
-      "targets": [
-        {
-          "rawSql": "WITH ing AS (SELECT toStartOfMinute(_ingested_at) AS t, count() AS c FROM network_health.silver_interface_stats_src WHERE _ingested_at >= now() - INTERVAL 24 HOUR GROUP BY t), dlq AS (SELECT toStartOfMinute(quarantined_at) AS t, count() AS c FROM network_health.silver_dlq_quarantine_src WHERE quarantined_at >= now() - INTERVAL 24 HOUR GROUP BY t) SELECT ing.t AS time, 'DLQ %' AS metric, ifNull(dlq.c, 0) / greatest(toFloat64(ing.c) + ifNull(dlq.c, 0), 1.0) * 100 AS value FROM ing LEFT JOIN dlq ON ing.t = dlq.t ORDER BY time"
+          "expr": "max(up)",
+          "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "percent",
+          "min": 0,
+          "max": 1,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "DOWN", "color": "red" },
+                "1": { "text": "UP", "color": "green" }
+              }
+            }
+          ],
           "thresholds": {
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 3 },
-              { "color": "red", "value": 5 }
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
             ]
           }
         }
       }
     },
     {
-      "id": 3,
-      "title": "Pipeline Freshness Lag (seconds)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "uid": "clickhouse" },
+      "id": 2,
+      "title": "ingest_records_total (sum)",
+      "type": "stat",
+      "gridPos": { "h": 7, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "uid": "prometheus" },
       "targets": [
         {
-          "rawSql": "SELECT now() AS time, 'silver_event_lag_s' AS metric, greatest(toFloat64(dateDiff('second', max(device_ts), now())), 0.0) AS value FROM network_health.silver_interface_stats_src WHERE device_ts >= now() - INTERVAL 24 HOUR UNION ALL SELECT now() AS time, 'silver_ingest_lag_s' AS metric, greatest(toFloat64(dateDiff('second', max(_ingested_at), now())), 0.0) AS value FROM network_health.silver_interface_stats_src WHERE _ingested_at >= now() - INTERVAL 24 HOUR UNION ALL SELECT now() AS time, 'gold_anomaly_lag_s' AS metric, greatest(toFloat64(dateDiff('second', max(detected_at), now())), 0.0) AS value FROM network_health.gold_anomaly_flags FINAL WHERE detected_at >= now() - INTERVAL 24 HOUR"
+          "expr": "sum(ingest_records_total)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "dlq_records_total (sum)",
+      "type": "stat",
+      "gridPos": { "h": 7, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(dlq_records_total)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "anomalies_total (sum)",
+      "type": "stat",
+      "gridPos": { "h": 7, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(anomalies_total)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Ingest Rate by Topic/Status",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (topic, status) (rate(ingest_records_total[1m]))",
+          "refId": "A",
+          "legendFormat": "{{ topic }} {{ status }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Anomaly Rate by Type",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (anomaly_type) (rate(anomalies_total[1m]))",
+          "refId": "A",
+          "legendFormat": "{{ anomaly_type }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Latest Site Health Score by Site",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "latest_site_health_score",
+          "refId": "A",
+          "legendFormat": "{{ site_id }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 100,
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 40 },
+              { "color": "green", "value": 70 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Health Score Summary (min/max/avg)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "min(latest_site_health_score)",
+          "refId": "A",
+          "legendFormat": "min"
+        },
+        {
+          "expr": "max(latest_site_health_score)",
+          "refId": "B",
+          "legendFormat": "max"
+        },
+        {
+          "expr": "avg(latest_site_health_score)",
+          "refId": "C",
+          "legendFormat": "avg"
         }
       ]
     },
     {
-      "id": 4,
-      "title": "Pipeline Latency per Stage (p99)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "uid": "clickhouse" },
+      "id": 9,
+      "title": "stream_batch_duration_seconds_bucket Presence",
+      "type": "stat",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 23 },
+      "datasource": { "uid": "prometheus" },
       "targets": [
         {
-          "rawSql": "SELECT toStartOfMinute(_ingested_at) AS time, 'silver_ingest_p99_s' AS metric, quantileTDigest(0.99)(greatest(toFloat64(dateDiff('second', device_ts, _ingested_at)), 0.0)) AS value FROM network_health.silver_interface_stats_src WHERE _ingested_at >= now() - INTERVAL 24 HOUR AND device_ts IS NOT NULL AND _ingested_at IS NOT NULL GROUP BY time UNION ALL SELECT toStartOfMinute(detected_at) AS time, 'gold_promote_p99_s' AS metric, quantileTDigest(0.99)(greatest(toFloat64(dateDiff('second', window_start, detected_at)), 0.0)) AS value FROM network_health.gold_anomaly_flags FINAL WHERE detected_at >= now() - INTERVAL 24 HOUR GROUP BY time ORDER BY time"
+          "expr": "count(stream_batch_duration_seconds_bucket)",
+          "refId": "A"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "s" } }
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": { "text": "no data", "color": "red" }
+              }
+            }
+          ],
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "stream_batch_duration_seconds p99 by Stage",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 23 },
+      "datasource": { "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, stage) (rate(stream_batch_duration_seconds_bucket[5m])))",
+          "refId": "A",
+          "legendFormat": "{{ stage }} p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
     }
   ]
 }

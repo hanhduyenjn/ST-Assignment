@@ -28,7 +28,7 @@ def _base_builder(app_name: str) -> SparkSession.Builder:
     )
     return (
         SparkSession.builder.appName(app_name)
-        .config("spark.master", os.environ.get("SPARK_MASTER", "local[2]"))
+        .config("spark.master", os.environ.get("SPARK_MASTER", "local[*]"))
         .config("spark.driver.extraClassPath", _SPARK_JARS_GLOB)
         .config("spark.executor.extraClassPath", _SPARK_JARS_GLOB)
         .config("spark.driver.extraJavaOptions", jvm_compat_opts)
@@ -94,6 +94,7 @@ class SparkSessionFactory:
 
         if mode == "streaming":
             shuffle_partitions = os.environ.get("SPARK_SHUFFLE_PARTITIONS", "8")
+            ui_port = os.environ.get("SPARK_UI_PORT", "4040")
             builder = (
                 builder
                 .config("spark.sql.shuffle.partitions", shuffle_partitions)
@@ -107,6 +108,9 @@ class SparkSessionFactory:
                 .config("spark.network.timeout", os.environ.get("SPARK_NETWORK_TIMEOUT", "300s"))
                 .config("spark.executor.heartbeatInterval", os.environ.get("SPARK_HEARTBEAT_INTERVAL", "30s"))
                 .config("spark.sql.session.timeZone", "UTC")
+                # UI for better visibility into streaming tasks
+                .config("spark.ui.enabled", "true")
+                .config("spark.ui.port", ui_port)
             )
 
         return builder.getOrCreate()

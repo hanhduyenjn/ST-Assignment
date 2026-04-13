@@ -11,10 +11,16 @@ rule_files:
   - /etc/prometheus/alerting_rules.yml
 
 scrape_configs:
-  # Pipeline application — custom Prometheus metrics from monitoring/exporter.py
+  # Query API — basic app health metrics served via prometheus_client ASGI mount
   - job_name: network_health_app
     static_configs:
-      - targets: ["app:8000"]
+      - targets: ["query-api:8000"]
+    metrics_path: /metrics
+
+  # Streaming pipeline — ingest/DLQ/anomaly/health-score metrics
+  - job_name: network_health_streaming
+    static_configs:
+      - targets: ["streaming:9108"]
     metrics_path: /metrics
 
   # Prometheus self-monitoring

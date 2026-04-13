@@ -20,16 +20,29 @@ from src.common.config import (
 )
 from src.common.logging import log
 from src.common.spark_session import SparkSessionFactory
+from src.monitoring.exporter import run_metrics_exporter
+from src.monitoring.metrics import (
+    ANOMALIES_TOTAL,
+    DLQ_RECORDS_TOTAL,
+    INGEST_RECORDS_TOTAL,
+    LATEST_HEALTH_SCORE,
+    STREAM_BATCH_DURATION_SECONDS,
+)
 from src.pipeline.silver_transforms import build_silver_dlq, build_silver_interface, build_silver_pending, build_silver_syslogs
 from src.storage.clickhouse_writer import ClickHouseWriter
 from src.storage.iceberg_writer import IcebergWriter
 from src.transforms.effective_util import effective_util_expr
+from src.transforms.flatline_v2 import detect_flatline
+from src.transforms.health_score import compute_health_score
 from src.validators.spark_expressions import interface_stats_validation_reason, syslogs_validation_reason
 
 SILVER_INTERFACE_STATS = "rest.silver.interface_stats"
 SILVER_SYSLOGS = "rest.silver.syslogs"
 SILVER_DLQ = "rest.silver.dlq_quarantine"
 SILVER_PENDING = "rest.silver.pending_enrichment"
+
+FLATLINE_VARIANCE_THRESHOLD = float(os.environ.get("FLATLINE_VARIANCE_THRESHOLD", "0.01"))
+FLATLINE_MIN_POINTS = int(os.environ.get("FLATLINE_MIN_POINTS", "30"))
 
 KAFKA_GROUP_INTERFACE = "main-streaming-interface-v1"
 KAFKA_GROUP_SYSLOGS = "main-streaming-syslogs-v1"
@@ -277,7 +290,10 @@ def _split_interface_records(batch_df: DataFrame, inventory_latest: DataFrame) -
 
 
 def _write_dlq(invalid_df: DataFrame, writer: IcebergWriter) -> None:
-    log.info("streaming.interface: writing invalid rows to DLQ")
+    row_count = invalid_df.count()
+    log.info("streaming.interface: writing invalid rows to DLQ count=%s", row_count)
+    if row_count == 0:
+        return
     dlq = build_silver_dlq(invalid_df, raw_col="payload")
     try:
         with _iceberg_write_lock:
@@ -287,7 +303,10 @@ def _write_dlq(invalid_df: DataFrame, writer: IcebergWriter) -> None:
 
 
 def _write_pending(pending_df: DataFrame, writer: IcebergWriter) -> None:
-    log.info("streaming.interface: writing rows to pending enrichment")
+    row_count = pending_df.count()
+    log.info("streaming.interface: writing rows to pending enrichment count=%s", row_count)
+    if row_count == 0:
+        return
     parked = build_silver_pending(pending_df, raw_col="payload")
     try:
         with _iceberg_write_lock:
@@ -300,7 +319,10 @@ def _write_enriched_interface(
     enriched_df: DataFrame,
     writer: IcebergWriter,
 ) -> None:
-    log.info("streaming.interface: writing enriched rows to silver interface table")
+    row_count = enriched_df.count()
+    log.info("streaming.interface: writing enriched rows to silver interface table count=%s", row_count)
+    if row_count == 0:
+        return
     # Use the shared silver schema projection from silver_transforms to ensure consistency
     silver = build_silver_interface(enriched_df)
     try:
@@ -311,44 +333,182 @@ def _write_enriched_interface(
 
 
 
+def _get_flatline_keys(enriched_df: DataFrame) -> set[tuple[str, str]]:
+    """Return (device_id, interface_name) pairs whose util_in is flat in this micro-batch.
+
+    Collects enriched rows to the driver, groups by device+interface, and applies
+    Welford online variance.  Only oper_status=1 rows count — a down interface is
+    not a flatline.  Requires FLATLINE_MIN_POINTS samples before firing to avoid
+    false positives on tiny micro-batches.
+    """
+    rows = (
+        enriched_df
+        .filter(F.col("oper_status") == 1)
+        .select("device_id", "interface_name", "effective_util_in")
+        .collect()
+    )
+    if not rows:
+        return set()
+
+    grouped: dict[tuple[str, str], list[float]] = {}
+    for row in rows:
+        key = (row.device_id, row.interface_name)
+        grouped.setdefault(key, []).append(float(row.effective_util_in))
+
+    flatline_keys: set[tuple[str, str]] = set()
+    for key, values in grouped.items():
+        is_flat, _var, _mean = detect_flatline(
+            values,
+            min_points=FLATLINE_MIN_POINTS,
+            eps=FLATLINE_VARIANCE_THRESHOLD,
+        )
+        if is_flat:
+            flatline_keys.add(key)
+
+    return flatline_keys
+
+
+def _apply_flatline_flags(enriched_df: DataFrame, flatline_keys: set[tuple[str, str]]) -> DataFrame:
+    """Merge FLATLINE into ingest_flags / ingest_anomaly for matching device+interface rows.
+
+    Mirrors the HIGH_Z_SCORE / IQR_OUTLIER / THRESHOLD_SATURATED pattern so all
+    anomaly types live on the same per-record columns and flow through mv_anomaly_summary
+    without any separate staging table.
+    """
+    if not flatline_keys:
+        return enriched_df
+
+    # Build a broadcast-friendly list of (device_id, interface_name) structs.
+    flatline_list = [{"device_id": d, "interface_name": i} for d, i in flatline_keys]
+    spark = enriched_df.sparkSession
+    flatline_df = spark.createDataFrame(flatline_list).select(
+        F.col("device_id").alias("_fl_did"),
+        F.col("interface_name").alias("_fl_iname"),
+        F.lit(True).alias("_is_flatline"),
+    )
+
+    joined = enriched_df.join(
+        F.broadcast(flatline_df),
+        on=(
+            (F.col("device_id")      == F.col("_fl_did")) &
+            (F.col("interface_name") == F.col("_fl_iname"))
+        ),
+        how="left",
+    ).drop("_fl_did", "_fl_iname")
+
+    is_flat = F.col("_is_flatline") == True  # noqa: E712
+    return (
+        joined
+        .withColumn(
+            "ingest_flags",
+            F.when(
+                is_flat,
+                F.array_union(F.coalesce(F.col("ingest_flags"), F.array()), F.array(F.lit("FLATLINE"))),
+            ).otherwise(F.col("ingest_flags")),
+        )
+        .withColumn(
+            "ingest_anomaly",
+            F.col("ingest_anomaly") | is_flat,
+        )
+        .drop("_is_flatline")
+    )
+
+
 def _process_interface_batch(batch_df: DataFrame, _: int, spark, writer: IcebergWriter, ch: ClickHouseWriter) -> None:
     if batch_df.isEmpty():
         log.info("streaming.interface: empty micro-batch")
         _debug("interface micro-batch empty")
         return
 
+    _batch_start = time.perf_counter()
+    batch_count = batch_df.count()
+    log.info("streaming.interface: micro-batch received count=%s", batch_count)
+    _debug("interface micro-batch received")
+
     _ensure_baseline_fresh(ch)
 
-    log.info("streaming.interface: micro-batch received")
-    _debug("interface micro-batch received")
     inventory_latest = _get_inventory_df(spark)
     invalid, pending, enriched = _split_interface_records(batch_df, inventory_latest)
+
+    invalid_count = invalid.count()
+    pending_count = pending.count()
+    enriched_count = enriched.count()
+    log.info("streaming.interface: split invalid=%s pending=%s enriched=%s", invalid_count, pending_count, enriched_count)
+
+    INGEST_RECORDS_TOTAL.labels(topic=KAFKA_TOPIC_INTERFACE_STATS, status="valid").inc(enriched_count + pending_count)
+    INGEST_RECORDS_TOTAL.labels(topic=KAFKA_TOPIC_INTERFACE_STATS, status="invalid").inc(invalid_count)
+    if invalid_count > 0:
+        DLQ_RECORDS_TOTAL.labels(topic=KAFKA_TOPIC_INTERFACE_STATS, reason="validation").inc(invalid_count)
+
     enriched = _apply_ingest_scores(enriched, spark)
+    flatline_keys = _get_flatline_keys(enriched)
+    if flatline_keys:
+        log.info("streaming.flatline: detected %d flatline device+interface pairs", len(flatline_keys))
+        enriched = _apply_flatline_flags(enriched, flatline_keys)
+
+    if enriched_count > 0:
+        anomaly_rows = (
+            enriched
+            .filter(F.col("ingest_anomaly"))
+            .select(F.explode(F.col("ingest_flags")).alias("anomaly_type"))
+            .groupBy("anomaly_type")
+            .count()
+            .collect()
+        )
+        for row in anomaly_rows:
+            ANOMALIES_TOTAL.labels(anomaly_type=row.anomaly_type).inc(row["count"])
+
+        site_rows = (
+            enriched
+            .filter(F.col("site_id").isNotNull())
+            .groupBy("site_id")
+            .agg(
+                F.avg(F.when(F.col("effective_util_in") > 80, 1.0).otherwise(0.0)).alias("pct_saturated"),
+                F.avg(F.when(F.col("oper_status") != 1, 1.0).otherwise(0.0)).alias("pct_down"),
+            )
+            .collect()
+        )
+        for row in site_rows:
+            if row.site_id:
+                score = compute_health_score(row.pct_saturated, 0, row.pct_down)
+                LATEST_HEALTH_SCORE.labels(site_id=row.site_id).set(score)
+
     _write_dlq(invalid, writer)
     _write_pending(pending, writer)
     _write_enriched_interface(enriched, writer)
+    STREAM_BATCH_DURATION_SECONDS.labels(stage="interface_stats").observe(time.perf_counter() - _batch_start)
 
 def _process_syslog_batch(batch_df: DataFrame, _: int, spark, writer: IcebergWriter) -> None:
     if batch_df.isEmpty():
         log.info("streaming.syslogs: empty micro-batch")
         _debug("syslog micro-batch empty")
         return
-    log.info("streaming.syslogs: micro-batch received")
+    _batch_start = time.perf_counter()
+    batch_count = batch_df.count()
+    log.info("streaming.syslogs: micro-batch received count=%s", batch_count)
     _debug("syslog micro-batch received")
     inventory_latest = _get_inventory_df(spark)
     staged = batch_df.join(inventory_latest, on="device_id", how="left")
     with_reason = staged.withColumn("validation_reason", syslogs_validation_reason())
     invalid = with_reason.filter(F.col("validation_reason").isNotNull())
+    invalid_count = invalid.count()
+    if invalid_count > 0:
+        INGEST_RECORDS_TOTAL.labels(topic=KAFKA_TOPIC_SYSLOGS, status="invalid").inc(invalid_count)
+        DLQ_RECORDS_TOTAL.labels(topic=KAFKA_TOPIC_SYSLOGS, reason="validation").inc(invalid_count)
     _write_dlq(invalid, writer)
 
     clean = with_reason.filter(F.col("validation_reason").isNull() & F.col("site_id").isNotNull())
-    log.info("streaming.syslogs: writing clean rows")
-    silver = build_silver_syslogs(clean)
-    try:
-        with _iceberg_write_lock:
-            writer.write_dataframe(silver, SILVER_SYSLOGS)
-    except Exception as e:
-        log.error("streaming.syslogs: write failed (continuing): %s", str(e)[:150])
+    clean_count = clean.count()
+    INGEST_RECORDS_TOTAL.labels(topic=KAFKA_TOPIC_SYSLOGS, status="valid").inc(clean_count)
+    log.info("streaming.syslogs: writing clean rows count=%s", clean_count)
+    if clean_count > 0:
+        silver = build_silver_syslogs(clean)
+        try:
+            with _iceberg_write_lock:
+                writer.write_dataframe(silver, SILVER_SYSLOGS)
+        except Exception as e:
+            log.error("streaming.syslogs: write failed (continuing): %s", str(e)[:150])
+    STREAM_BATCH_DURATION_SECONDS.labels(stage="syslogs").observe(time.perf_counter() - _batch_start)
 
 
 def _replay_pending_from_inventory(inventory_batch: DataFrame, _: int, spark, writer: IcebergWriter) -> None:
@@ -413,8 +573,13 @@ def _replay_pending_from_inventory(inventory_batch: DataFrame, _: int, spark, wr
     # Replayed records were already validated at park time; re-score against current
     # baseline so late-enriched silver rows carry accurate ingest_* annotations.
     enriched = _apply_ingest_scores(enriched, spark)
+    flatline_keys = _get_flatline_keys(enriched)
+    if flatline_keys:
+        log.info("streaming.flatline: detected %d flatline pairs (replay path)", len(flatline_keys))
+        enriched = _apply_flatline_flags(enriched, flatline_keys)
 
-    log.info("streaming.inventory: replaying pending rows for device_ids=%s", new_device_ids)
+    replay_count = enriched.count()
+    log.info("streaming.inventory: replaying pending rows for device_ids=%s count=%s", new_device_ids, replay_count)
     _write_enriched_interface(enriched, writer)
 
     # 5. Mark resolved rows as enriched so the batch safety-net job skips them.
@@ -444,6 +609,10 @@ def run() -> None:
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
         )
+
+    _metrics_thread = threading.Thread(target=run_metrics_exporter, daemon=True, name="metrics-exporter")
+    _metrics_thread.start()
+    log.info("streaming: metrics exporter started on port 9108")
 
     spark = SparkSessionFactory.create(mode="streaming", app_name="main-streaming")
     logging.getLogger().setLevel(logging.INFO)

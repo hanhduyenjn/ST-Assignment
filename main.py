@@ -7,7 +7,7 @@ from src.pipeline.batch import run as run_backfill
 from src.pipeline.bronze_ingest import run as run_bronze_ingest
 from src.pipeline.baseline_refresh import run as run_baseline_refresh
 from src.pipeline.dlq_reprocessor import run as run_dlq_reprocessor
-from src.pipeline.flatline_streaming_v1 import run as run_flatline_streaming_v1
+from src.pipeline.flatline_streaming import run as run_flatline_streaming
 from src.pipeline.gold_recompute import run as run_gold_recompute
 from src.pipeline.isolation_forest_train import run as run_isolation_forest_train
 from src.pipeline.pending_enrichment import run as run_pending_enrichment
@@ -65,7 +65,7 @@ def main() -> None:
     elif args.mode == "streaming":
         run_streaming()
     elif args.mode == "flatline-streaming":
-        run_flatline_streaming_v1()
+        run_flatline_streaming()
     elif args.mode == "pending-enrichment":
         run_pending_enrichment()
     elif args.mode == "gold-recompute":

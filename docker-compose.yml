@@ -29,7 +29,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
-    SPARK_MASTER_URL: ${SPARK_MASTER_URL}
+    SPARK_MASTER_URL: ${SPARK_MASTER_URL:-spark://spark-master:7077}
     PYTHONPATH: /opt/airflow
   volumes:
     - ./dags:/opt/airflow/dags:ro
@@ -138,7 +138,8 @@ services:
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 12
+      start_period: 40s
 
   minio-init:
     image: minio/mc:RELEASE.2025-08-13T08-35-41Z
@@ -246,24 +247,6 @@ services:
         soft: 262144
         hard: 262144
 
-  clickhouse-baseline-refresh-trigger:
-    image: clickhouse/clickhouse-server:25.8
-    container_name: clickhouse-baseline-refresh-trigger
-    hostname: clickhouse-baseline-refresh-trigger
-    networks: [network-health-net]
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-    entrypoint: ["/bin/bash", "-c"]
-    command: >
-      "
-      while true; do
-        clickhouse-client --host clickhouse --query \"SYSTEM REFRESH VIEW network_health.mv_device_baseline_refresh\";
-        sleep ${BASELINE_REFRESH_INTERVAL_SECONDS:-300};
-      done
-      "
-    restart: unless-stopped
-
   spark-master:
     image: bitnamilegacy/spark:3.5.1
     container_name: spark-master
@@ -296,7 +279,7 @@ services:
       - "8081:8081"   # UI
     environment:
       SPARK_MODE: worker
-      SPARK_MASTER_URL: ${SPARK_MASTER_URL}
+      SPARK_MASTER_URL: ${SPARK_MASTER_URL:-spark://spark-master:7077}
       SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY}
       SPARK_WORKER_CORES: ${SPARK_WORKER_CORES}
       SPARK_RPC_AUTHENTICATION_ENABLED: "no"
@@ -553,6 +536,9 @@ services:
     <<: *app-service
     container_name: streaming
     hostname: streaming
+    ports:
+      - "4040:4040"   # Spark UI
+      - "9108:9108"   # Prometheus metrics exporter
     environment:
       FLATLINE_VARIANCE_THRESHOLD: "0.01"
     depends_on:
@@ -564,24 +550,27 @@ services:
         condition: service_healthy
     command: ["--mode", "streaming"]
 
-  flatline-streaming:
-    <<: *app-service
-    container_name: flatline-streaming
-    hostname: flatline-streaming
-    profiles: ["legacy-anomaly-streams"]
-    environment:
-      FLATLINE_WATERMARK_DELAY: "1 minute"
-      FLATLINE_VARIANCE_THRESHOLD: "0.01"
-    depends_on:
-      kafka:
-        condition: service_healthy
-      iceberg-rest:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
-      streaming:
-        condition: service_started
-    command: ["--mode", "flatline-streaming"]
+  # flatline-streaming:
+  #   <<: *app-service
+  #   container_name: flatline-streaming
+  #   hostname: flatline-streaming
+  #   environment:
+  #     FLATLINE_WATERMARK_DELAY: "1 minute"
+  #     FLATLINE_VARIANCE_THRESHOLD: "0.01"
+  #     FLATLINE_WINDOW_DURATION: "10 minutes" # supposed to be 4 hours but for testing we use a shorter window
+  #     SPARK_MASTER: "local[*]"
+  #     SPARK_DRIVER_MEMORY: "1g"
+  #     SPARK_JAVA_COMPAT_OPTS: "--add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-exports=java.base/sun.nio.ch=ALL-UNNAMED -XX:+UseSerialGC"
+  #   depends_on:
+  #     kafka:
+  #       condition: service_healthy
+  #     iceberg-rest:
+  #       condition: service_healthy
+  #     clickhouse:
+  #       condition: service_healthy
+  #     streaming:
+  #       condition: service_started
+  #   command: ["--mode", "flatline-streaming"]
 
   query-api:
     <<: *app-service
@@ -599,3 +588,50 @@ services:
     volumes:
       - ./data:/app/data:ro
     command: ["--mode", "query-api", "--host", "0.0.0.0", "--port", "8000"]
+
+  validate-pipeline:
+    image: docker:27-cli
+    container_name: validate-pipeline
+    hostname: validate-pipeline
+    networks: [network-health-net]
+    depends_on:
+      producer-interface:
+        condition: service_started
+      producer-syslogs:
+        condition: service_started
+      producer-inventory:
+        condition: service_started
+      bronze-ingest:
+        condition: service_started
+      streaming:
+        condition: service_started
+      clickhouse:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./:/workspace
+    working_dir: /workspace
+    environment:
+      VALIDATE_WAIT_SECONDS: "${VALIDATE_WAIT_SECONDS:-60}"
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "
+      apk add --no-cache bash curl python3 >/dev/null &&
+      echo 'Waiting for all pipeline containers to be running...' &&
+      for svc in producer-interface producer-syslogs producer-inventory bronze-ingest streaming query-api; do
+        until [ \"$(docker inspect -f '{{.State.Status}}' $$svc 2>/dev/null)\" = \"running\" ]; do
+          echo \"  $$svc not yet running, retrying...\";
+          sleep 3;
+        done;
+        echo \"  $$svc is running\";
+      done &&
+      echo \"All pipelines up. Waiting $${VALIDATE_WAIT_SECONDS}s for data to flow...\" &&
+      sleep $${VALIDATE_WAIT_SECONDS} &&
+      echo 'Running pipeline validation...' &&
+      bash ./scripts/validate_pipeline.sh
+      "
+    restart: "no"

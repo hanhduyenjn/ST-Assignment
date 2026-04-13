@@ -100,7 +100,7 @@ def _kafka_stream(spark: SparkSession, topic: str, group_id: str):
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
         .option("subscribe", topic)
         .option("kafka.group.id", group_id)
-        .option("startingOffsets", "earliest")
+        .option("startingOffsets", "latest")
         .option("failOnDataLoss", "false")
         .load()
         .selectExpr("CAST(value AS STRING) AS _raw_payload", "timestamp AS _kafka_ts")

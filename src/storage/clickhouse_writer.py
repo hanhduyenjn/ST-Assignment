@@ -56,6 +56,6 @@ class ClickHouseWriter:
             iqr_k,
             isolation_score_threshold,
             distilled_rules
-        FROM device_baseline_params
+        FROM device_baseline_params FINAL
         """
         return self.query(sql)

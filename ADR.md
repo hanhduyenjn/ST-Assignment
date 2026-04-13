@@ -8,44 +8,25 @@
 ## System Screenshots
 
 ### Airflow — DAG overview
+http://localhost:8085       (admin/admin)
+![alt text](image-2.png)
 
-<!-- TODO: screenshot of Airflow DAGs list (nightly_batch_dag, weekly_batch_dag, backfill_dag) -->
+### Grafana — Health Dashboard
+http://localhost:3000       (admin/admin)
+![alt text](image-7.png)
 
-### Airflow — nightly_batch_dag run
+### Spark UI
+http://localhost:8080 (for batch jobs) or http://localhost:4040 (for streaming jobs)
 
-<!-- TODO: screenshot of a successful nightly_batch_dag run (task graph view) -->
+![alt text](image.png)
+![alt text](image-1.png)
 
-### Airflow — weekly_batch_dag run
-
-<!-- TODO: screenshot of a successful weekly_batch_dag run (isolation_forest_train → psi_drift_detect) -->
-
-### Spark Master UI
-
-<!-- TODO: screenshot of Spark Master UI (http://localhost:8080) showing connected workers and completed applications -->
-
-### Grafana — Pipeline Dashboard
-
-<!-- TODO: screenshot of pipeline.json dashboard (Kafka lag, throughput, DLQ rate) -->
-
-### Grafana — Anomaly Dashboard
-
-<!-- TODO: screenshot of anomaly.json dashboard (flatline events, site health scores) -->
-
-### Grafana — Data Quality Dashboard
-
-<!-- TODO: screenshot of data_quality.json dashboard (quarantine breakdown, false-positive rate) -->
-
-### ClickHouse — Gold Tables
-
-<!-- TODO: screenshot of ClickHouse query showing gold_site_health_hourly rows (SELECT * FROM gold_site_health_hourly LIMIT 20) -->
-
-### ClickHouse — Anomaly Flags
-
-<!-- TODO: screenshot of gold_anomaly_flags (SELECT * FROM gold_anomaly_flags LIMIT 20) -->
+### ClickHouse
+![alt text](image-3.png)
 
 ### MinIO — Lakehouse Bucket
-
-<!-- TODO: screenshot of MinIO console (http://localhost:9001) showing lakehouse/ bucket: bronze/, silver/, checkpoints/, models/ prefixes -->
+http://localhost:9001 (minioadmin/ minioadmin123)
+![alt text](image-4.png)
 
 ---
 
@@ -91,10 +72,10 @@ CSV / JSONL files
                      ┌──────────────────────────────┼──────────────────────────────┐
                      ▼                              ▼                              ▼
              device_baseline_params       mv_anomaly_summary        gold_site_health_hourly
-             (3 weekly sources:            (1-min refresh)           (SummingMergeTree)
+             (2 weekly sources:            (1-min refresh)           (SummingMergeTree)
               isolation_forest_train       Deduplicates & promotes   Aggregates via
-              psi_drift_detect             anomalies to              mv_site_health_hourly
-              mv_baseline_refresh)         gold_anomaly_flags
+              psi_drift_detect)            anomalies to              mv_site_health_hourly
+                                           gold_anomaly_flags
                                           (5-min windows)
                                                     │
                                                     ▼
@@ -106,7 +87,7 @@ CSV / JSONL files
 
 AIRFLOW-ORCHESTRATED BATCH JOBS
   nightly_batch_dag  (01:00 daily):
-    dlq_reprocess → pending_enrichment → gold_recompute → model_detect (Isolation Forest)
+    dlq_reprocess → pending_enrichment → model_detect (Isolation Forest)
   weekly_batch_dag   (02:00 Sunday):
     isolation_forest_train → psi_drift_detect
   backfill_dag       (manual):
@@ -118,15 +99,16 @@ AIRFLOW-ORCHESTRATED BATCH JOBS
 ## Data Architecture: ClickHouse Tables & Views
 
 **Silver layer** (Iceberg tables, read via ClickHouse native Iceberg engine):
-- `silver_interface_stats_src` — per-record ingest_z_score, ingest_iqr_score, ingest_anomaly, ingest_flags
+- `silver_interface_stats_src` — per-record ingest_z_score, ingest_iqr_score, ingest_anomaly, ingest_flags (includes FLATLINE, HIGH_Z_SCORE, IQR_OUTLIER, THRESHOLD_SATURATED)
 - `silver_syslogs_src` — critical syslog events
-- `silver_flatline_anomaly_flags` — staging for flatline detector (experimental)
+- `silver_flatline_anomaly_flags` — legacy staging table; no longer written by active jobs (FLATLINE now detected inline and written to silver interface stats `ingest_flags`)
 
 **Baselines** — `device_baseline_params` (ReplacingMergeTree, valid_from ordered):
 - Written by 2 weekly sources (source tracked in distilled_rules JSON):
   - `isolation_forest_train.py` — 30-day statistical baseline (z-score bounds)
   - `psi_drift_detect.py` — drift-corrected baseline if PSI > 0.25
-- Consumed by: `streaming.py` (TTL 30 min refresh), batch jobs
+- Consumed by: `streaming.py` (TTL 30 min refresh), `batch.py` (loaded at job start)
+- Note: `mv_device_baseline_refresh` was removed — it overwrote seeded baselines with computed zeros for test devices
 
 **Materialized Views** (refresh every 1 minute, append-only to gold):
 - `mv_anomaly_summary` — deduplicates & promotes silver ingest flags to `gold_anomaly_flags` (5-min windows, ≥3 violations)
@@ -143,7 +125,7 @@ AIRFLOW-ORCHESTRATED BATCH JOBS
 | Component | Technology | Rationale |
 |-----------|-----------|-----------|
 | Message bus | Apache Kafka | Decouples producers from consumers; enables replay; compacted topic for inventory gives CRDT-like upsert semantics; keyed by `device_id` preserves per-device ordering for stateful detection |
-| Open table format | Apache Iceberg | ACID writes, time-travel, partition evolution, schema evolution — REST Catalog is engine-agnostic; DuckDB, ClickHouse, Spark, Trino all connect via the same API |
+| Open table format | Apache Iceberg | ACID writes, time-travel, partition evolution, schema evolution — REST Catalog is engine-agnostic; ClickHouse, Spark, Trino all connect via the same API |
 | Object store | MinIO | S3-compatible drop-in. Single-node for PoC; scales to multi-drive or Ceph for production without client changes |
 | Batch + stream compute | PySpark 3.5 | Single engine for both streaming (Structured Streaming) and batch (DataFrame API). Spark is explicitly required in Challenge 1 |
 | OLAP query layer | ClickHouse | Sub-second aggregation queries. `ReplacingMergeTree` gives upsert semantics for gold tables. Refreshable Materialized Views push aggregation to near-real-time without a separate Spark job. Native Iceberg table engine reads silver directly |
@@ -189,15 +171,24 @@ ingest-time checks and under four hours for sliding-window flatline detection.
 Streaming jobs can lag or fail. The `nightly_batch_dag` runs four sequential
 tasks that recover anything missed:
 
+**Handle Orphaned Records By Parking for Late Enrichment**
+![alt text](image-5.png)
+I don't immediately route orphaned records to DLQ, because they may be enriched later when the inventory record arrives. Instead, I park them in `silver.pending_enrichment` and trigger a replay for that `device_id` when a new inventory record arrives. This gives late-arriving inventory a chance to enrich prior orphaned records without waiting for the nightly batch job.
+
 1. `dlq_reprocess` — promotes quarantined records whose `device_id` has since
    appeared in inventory; marks permanent failures.
 2. `pending_enrichment` — enriches records parked in `silver.pending_enrichment`
    once a matching inventory row arrives; increments `retry_count` on each
    failed attempt.
-3. `gold_recompute` — rewrites the last 25 hours of gold aggregates from clean
-   silver data, incorporating any records just promoted in steps 1 and 2.
-4. `model_detect` (batch) — applies the trained Isolation Forest model to
+3. `model_detect` (batch) — applies the trained Isolation Forest model to
    yesterday's silver data for records the streaming scorer did not flag.
+
+**Batch anomaly scoring (`batch.py`):**
+The backfill job loads baseline params from ClickHouse at job start and calls
+`apply_ingest_scores()` — the same function used by streaming — so backfilled
+silver rows carry accurate ingest_z_score, ingest_iqr_score, and ingest_flags.
+Falls back to an empty baseline (only THRESHOLD_SATURATED can fire) if
+ClickHouse is unreachable.
 
 **Pending enrichment — event-driven first:**
 When a new inventory record arrives, the streaming job automatically re-processes
@@ -249,6 +240,7 @@ retroactively. All updates via Iceberg `MERGE INTO` are atomic and idempotent.
 **Metrics:** `dlq_records_total[topic, reason]` counter per rejection.
 AlertManager fires a `WARNING` if DLQ rate exceeds 5 % of ingested volume for
 more than two minutes.
+
 
 ---
 
@@ -420,7 +412,7 @@ hourly = (
 
 | Layer | Method | Latency |
 |-------|--------|---------|
-| **Ingest-time** | Threshold (util > 80%) + Z-score/IQR | ~30s |
+| **Ingest-time** | Threshold (util > 80%) + Z-score/IQR + Flatline (Welford) | ~30s |
 | **Weekly batch** | Isolation Forest (10-feature multivariate) | ~1 day |
 | **Weekly validation** | PSI drift detection | ~1 day |
 
@@ -428,6 +420,7 @@ hourly = (
 - Baselines from ClickHouse `device_baseline_params` table
 - Z-score: `|util − mean| / (std + ε) > 2.0` → `HIGH_Z_SCORE`
 - IQR: `|util − mean| / (iqr_k × std + ε) > 1.0` → `IQR_OUTLIER`
+- Flatline: Welford online variance over all UP-interface rows in the micro-batch → `FLATLINE`
 - Refreshed every 30 minutes from ClickHouse
 
 **Dual baseline sources** (both write to `device_baseline_params`, tracked via distilled_rules.source):
@@ -445,25 +438,26 @@ hourly = (
    - Detects capacity upgrades, traffic changes, firmware updates, seasonal shifts
    - Source: "psi_drift_detector"
 
-**Why dual sources:**
+**Why dual sources (not three):**
 - ReplacingMergeTree (valid_from versioned) picks latest baseline automatically
 - IF provides statistically trained baseline; PSI ensures it adapts to real-world changes
 - Source field in distilled_rules enables audit trail and debugging
+- `mv_device_baseline_refresh` (formerly a third source) was dropped: it computed
+  `avg(effective_util_in)` from all silver data including anomalous periods, resulting
+  in zero-mean baselines for test devices where seeded values were the only truth signal.
+  Removing it prevents the MV from overwriting carefully seeded or IF-trained baselines.
 
 ### Anomaly Detection Split: Ingest-time vs Batch
 
 **Current implementation (ingest-time):**
-Streaming pipeline runs per-record scoring:
-- Threshold alerting (util > 80%)
-- Z-score / IQR scoring (stateless, baseline-driven)
-These provide seconds-latency anomaly detection with no window delay.
+Streaming pipeline runs per-record scoring inside each `foreachBatch` callback:
+- Threshold alerting (util > 80%) → `THRESHOLD_SATURATED`
+- Z-score / IQR scoring (stateless, baseline-driven) → `HIGH_Z_SCORE`, `IQR_OUTLIER`
+- Welford variance flatline detection (driver-side, per micro-batch) → `FLATLINE`
 
-**Future enhancement (windowed detection):**
-Flatline detection via 4-hour tumbling windows would catch silent failures
-(sensors UP but utilization stuck). A reference implementation exists but is not
-currently active. The decision: detect outliers immediately (ingest-time) and
-detect complex patterns in batch (Isolation Forest), rather than add streaming
-window complexity.
+All four flag types are written as `ingest_flags` array entries on each silver
+interface stats row. `mv_anomaly_summary` ARRAY JOINs `ingest_flags` and promotes
+to `gold_anomaly_flags` with a ≥3 violation debounce (5-min windows).
 
 ### Why Isolation Forest runs in batch, not streaming
 
@@ -474,8 +468,8 @@ Running a batch-trained sklearn model inline in every Spark micro-batch would:
 - Make the streaming job stateful in a way Spark checkpoints cannot capture.
 
 The right split: **stateless per-record checks (Z-score, IQR, threshold) and
-windowed statistical checks (flatline) in streaming; the heavier multivariate
-model in nightly batch** where the latency budget is hours, not seconds.
+lightweight variance checks (Welford flatline) in streaming; the heavier
+multivariate model in nightly batch** where the latency budget is hours, not seconds.
 
 ### Why online learning (Half-Space Trees, RRCF) was rejected
 
@@ -488,36 +482,52 @@ cannot distinguish between the two. The decision mirrors production practice at
 Cloudflare, Netflix, and Datadog: controlled periodic retraining on a
 validated-normal corpus.
 
-### Flatline Detection (Reference Implementation)
+### Flatline Detection (Active — Welford Inline)
 
-Flatline detection reference implementation is available in:
-- [src/models/flatline_detector.py](src/models/flatline_detector.py) — detector logic
-- [src/pipeline/flatline_streaming_v1.py](src/pipeline/flatline_streaming_v1.py) — streaming integration (experimental)
+Flatline detection is **active** and runs inside each `foreachBatch` callback of
+`streaming.py` without a separate Spark job or JVM process. The approach uses the
+Welford online variance algorithm from [src/transforms/flatline_v2.py](src/transforms/flatline_v2.py).
 
-**Implementation concept** (not currently active):
+**Why not a separate Spark job with 4-hour tumbling windows:**
+- Tumbling-window append mode only emits after watermark passes the window end
+  (08:00+ for a 4-hour window), so short test bursts (4 minutes) never emit.
+- Running two Spark JVMs on a laptop caused JVM SIGSEGV (G1GC OOM crashes).
+- The approach is over-engineered for the PoC scale.
+
+**Active implementation** ([src/pipeline/streaming.py](src/pipeline/streaming.py)):
 
 ```python
-# Four-hour tumbling window, 1-minute watermark for late arrivals
-windowed = (
-    silver_stream
-    .withWatermark("device_ts", "1 minute")
-    .filter(F.col("oper_status") == 1)          # UP interfaces only
-    .groupBy(
-        "device_id", "site_id", "interface_name",
-        F.window("device_ts", "4 hours").alias("w"),
-    )
-    .agg(
-        F.variance("effective_util_in").alias("variance_in"),
-        F.avg("effective_util_in").alias("mean_util_in"),
-        F.stddev("effective_util_in").alias("std_util_in"),
-    )
-    .filter(F.col("variance_in") <= FLATLINE_VARIANCE_THRESHOLD)  # env-configurable
-)
+# Driver-side, per micro-batch — no UDF, no second Spark job
+def _get_flatline_keys(enriched_df):
+    rows = enriched_df.filter(col("oper_status") == 1)
+                      .select("device_id", "interface_name", "effective_util_in")
+                      .collect()
+    # Group by (device_id, interface_name), run Welford variance on values
+    # Returns set of (device_id, interface_name) pairs where variance < eps
+    ...
+
+def _apply_flatline_flags(enriched_df, flatline_keys):
+    # Broadcast-join flatline keys back to mark each matching row:
+    #   ingest_flags = array_union(ingest_flags, ["FLATLINE"])
+    #   ingest_anomaly = True
+    ...
 ```
 
-**Status:** Flatline detection is a proposed enhancement. Current streaming pipeline
-focuses on per-record ingest-time scoring (threshold + Z-score + IQR). Windowed
-detection is deferred to batch analysis via Isolation Forest.
+Both the normal enrichment path (`_process_interface_batch`) and the inventory
+replay path (`_replay_pending_from_inventory`) call these functions so flatline
+detection applies regardless of whether inventory was cached at arrival time.
+
+**Configuration** (environment variables):
+- `FLATLINE_VARIANCE_THRESHOLD` (default: `0.01`) — max variance to classify as flatline
+- `FLATLINE_MIN_POINTS` (default: `30`) — minimum samples per (device, interface) group
+
+**Gold flow:** FLATLINE in `ingest_flags` → `mv_anomaly_summary` ARRAY JOIN →
+`gold_anomaly_flags` (same debounce path as HIGH_Z_SCORE / IQR_OUTLIER).
+
+**Legacy path:** `silver_flatline_anomaly_flags` still participates in the
+`mv_anomaly_summary` UNION ALL (for backward compatibility) but is no longer
+written by any active job. The `flatline-streaming` Docker Compose service is
+commented out.
 
 ---
 
@@ -590,6 +600,110 @@ site_health_score{site_id}                 Gauge      # latest score
 
 ---
 
+## Validation Script Result: [scripts/validate_pipeline.sh](scripts/validate_pipeline.sh)
+{13:18}~/ST-Assignment:feature/add-anomaly-dection ✗ ➭ ./scripts/validate_pipeline.sh
+╔════════════════════════════════════════════════════════════════╗
+║          Network Health Pipeline Validation Script             ║
+╚════════════════════════════════════════════════════════════════╝
+
+═══════════════════════════════════════════════════════════════════
+ PHASE 1: Services Running
+═══════════════════════════════════════════════════════════════════
+✓ zookeeper is running
+✓ kafka is running
+✓ minio is running
+✓ iceberg-rest is running
+✓ spark-master is running
+✓ spark-worker is running
+✓ clickhouse is running
+✓ producer-interface is running
+✓ producer-syslogs is running
+✓ producer-inventory is running
+✓ bronze-ingest is running
+✓ streaming is running
+✓ query-api is running
+
+═══════════════════════════════════════════════════════════════════
+ PHASE 2: Bronze Layer (Iceberg) — row counts
+═══════════════════════════════════════════════════════════════════
+✓ Iceberg REST catalog reachable
+✓ bronze.syslogs: 124650 rows
+✓ bronze.interface_stats: 122020 rows
+✓ bronze.inventory: 700 rows
+
+ℹ Total bronze rows across all tables: 247370
+
+═══════════════════════════════════════════════════════════════════
+ PHASE 3: Silver Layer (ClickHouse mirrors & staging)
+═══════════════════════════════════════════════════════════════════
+✓ silver.silver_interface_stats_src: 772010 rows
+✓ silver.silver_syslogs_src: 100690 rows
+⚠ silver.silver_flatline_anomaly_flags: 0 rows (streaming job may not have caught up)
+
+DLQ quarantine status:
+✓ DLQ is clean: 0 quarantined
+
+═══════════════════════════════════════════════════════════════════
+ PHASE 5: Baselines & Materialized Views
+═══════════════════════════════════════════════════════════════════
+Device baseline parameters (ReplacingMergeTree):
+✓ device_baseline_params: 17649 rows
+ℹ   Sources: ,
+
+Materialized Views (refreshed every 1 minute):
+✓ MV mv_anomaly_summary exists
+✓ MV mv_site_health_hourly exists
+
+═══════════════════════════════════════════════════════════════════
+ PHASE 6: Gold Layer (ClickHouse)
+═══════════════════════════════════════════════════════════════════
+✓ gold.gold_site_health_hourly: 8507 rows
+✓ gold.gold_anomaly_flags: 1018 rows
+
+Gold layer aggregation quality:
+ℹ Site health aggregations:
+ℹ   DC1: records=1876 min=20 max=100 avg=81.96
+ℹ   DC2: records=1824 min=20 max=100 avg=80.94
+ℹ   SITE-A: records=2148 min=20 max=100 avg=81.07
+ℹ   SITE-B: records=1599 min=20 max=100 avg=80.18
+ℹ   SITE-C: records=1060 min=20 max=100 avg=82.24
+
+═══════════════════════════════════════════════════════════════════
+ PHASE 7: Prometheus Metrics (Pipeline Observability)
+═══════════════════════════════════════════════════════════════════
+✓ Prometheus reachable at http://localhost:9090
+
+Ingest pipeline metrics:
+⚠   ingest_records_total: 0 (no ingest yet)
+✓   dlq_records_total: 0 (no rejections)
+
+Anomaly detection metrics:
+⚠   anomalies_total: 0 (no anomalies detected yet)
+ℹ   latest_site_health_score: no data
+
+Pipeline latency metrics:
+⚠   stream_batch_duration_seconds: no histogram data yet
+
+═══════════════════════════════════════════════════════════════════
+ PHASE 8: Anomaly Detection
+═══════════════════════════════════════════════════════════════════
+Anomaly type counts on gold_anomaly_flags FINAL:
+⚠   THRESHOLD_SATURATED: 0
+✓   HIGH_Z_SCORE: 8
+✓   IQR_OUTLIER: 8
+✓   FLATLINE: 6
+✓   CRITICAL_SYSLOG_BURST: 568
+⚠   MODEL: 0
+ℹ   total gold anomaly records: 590
+
+Site degradation alerts (health_score < 40):
+⚠   Degraded sites detected:
+⚠     DC2: 3 windows, min=20 avg=20
+⚠     SITE-B: 20 windows, min=20 avg=20
+⚠     DC1: 17 windows, min=20 avg=20.1
+⚠     SITE-C: 3 windows, min=20 avg=20
+⚠     SITE-A: 15 windows, min=20 avg=23.4
+
 ## Production Upgrade Path
 
 | PoC component | Production swap-in | Effort |
@@ -631,9 +745,10 @@ site_health_score{site_id}                 Gauge      # latest score
    schema evolution for free: unknown columns are captured, preserved, and
    formally promotable without pipeline downtime.
 
-6. **Layered anomaly detection (threshold → Z-score/IQR → flatline → Isolation
-   Forest)** places each model at the right point in the latency/complexity
-   trade-off. Online learning was explicitly rejected to avoid concept
+6. **Layered anomaly detection (threshold → Z-score/IQR → Welford flatline → Isolation
+   Forest)** places each check at the right point in the latency/complexity trade-off.
+   All four ingest-time checks run inline in `foreachBatch` (~30 s latency) without a
+   second Spark JVM. Online learning was explicitly rejected to avoid concept
    contamination.
 
 7. **Isolation Forest baseline initialization** trains weekly on 30 days of
@@ -655,10 +770,14 @@ site_health_score{site_id}                 Gauge      # latest score
     - Isolation Forest (sklearn): 30-day statistical baseline training with distilled rules
     - PSI Drift Detector: corrects baselines when distribution shifts (PSI > 0.25)
     Both write to `device_baseline_params` (ReplacingMergeTree, valid_from versioned).
-    Streaming loads baselines every 30 minutes; source field in distilled_rules enables audit.
+    Streaming loads baselines every 30 minutes; batch loads at job start; source field in
+    distilled_rules enables audit. `mv_device_baseline_refresh` was removed because it
+    computed zero-mean baselines from anomaly-contaminated data, overwriting valid seeded
+    and IF-trained values.
 
-11. **ClickHouse Materialized Views** (2 active, 1-min refresh):
-    - `mv_anomaly_summary`: Deduplicates ingest flags, promotes to gold_anomaly_flags (5-min windows, ≥3 violations)
+11. **ClickHouse Materialized Views** (3 active, 1-min refresh):
+    - `mv_anomaly_summary`: ARRAY JOINs silver `ingest_flags` (all 4 types incl. FLATLINE), promotes to gold_anomaly_flags (5-min windows, ≥3 violations)
+    - `mv_syslog_anomaly_summary`: Promotes CRITICAL_SYSLOG_BURST from silver syslogs (≥3 critical in 5 min)
     - `mv_site_health_hourly`: Aggregates interface stats → gold_site_health_hourly (hourly)
     Sub-minute latency, zero Spark overhead, add metrics with pure SQL.
 

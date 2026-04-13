@@ -1,21 +1,21 @@
 device_id,site_id,vendor,role
-core-sw1,SITE-C,HP,gateway
-core-sw2,DC1,Arista,ap
-edge-r1,SITE-B,Fortinet,gateway
-edge-r2,DC1,Fortinet,ap
-fw1,SITE-B,Arista,gateway
-fw2,SITE-B,Dell,load-balancer
-ap1,DC1,Cisco,router
-ap2,DC1,Dell,gateway
-ap3,SITE-A,Palo Alto,firewall
-lb1,SITE-C,Arista,load-balancer
-lb2,SITE-A,Juniper,router
-router-a,SITE-C,Palo Alto,gateway
-router-b,SITE-C,HP,switch
-switch-prod,SITE-C,Dell,ap
-switch-dr,SITE-B,Palo Alto,load-balancer
-fw-dmz,SITE-B,Dell,switch
-vpn-gateway,DC1,Juniper,switch
-dns-primary,SITE-C,Juniper,firewall
-ntp-server,DC2,Cisco,switch
-syslog-server,DC2,HP,load-balancer
+core-sw1,DC1,Fortinet,load-balancer
+core-sw2,DC2,Juniper,firewall
+edge-r1,SITE-A,Arista,firewall
+edge-r2,SITE-C,Juniper,firewall
+fw1,DC1,HP,gateway
+fw2,SITE-C,Palo Alto,ap
+ap1,SITE-A,Dell,firewall
+ap2,SITE-A,Palo Alto,load-balancer
+ap3,DC1,Fortinet,load-balancer
+lb1,DC2,Palo Alto,load-balancer
+lb2,DC1,Palo Alto,firewall
+router-a,DC2,Arista,firewall
+router-b,DC1,Arista,firewall
+switch-prod,DC2,Dell,switch
+switch-dr,SITE-B,HP,router
+fw-dmz,SITE-A,Juniper,switch
+vpn-gateway,SITE-A,Fortinet,load-balancer
+dns-primary,SITE-A,Fortinet,ap
+ntp-server,SITE-A,Juniper,load-balancer
+syslog-server,SITE-A,Fortinet,switch

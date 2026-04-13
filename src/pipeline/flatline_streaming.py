@@ -1,6 +1,22 @@
-"""Legacy flatline detection using 4-hour tumbling variance windows.
+"""Flatline Detection via Spark Structured Streaming (ACTIVE IMPLEMENTATION).
 
-Preserved as the old implementation before ingest-time anomaly scoring updates.
+This is a standalone, always-on streaming job that continuously monitors for flatlines.
+It uses Spark's distributed processing to detect when metrics become flat (zero variance).
+
+Architecture:
+  - Reads from: silver.interface_stats (Iceberg streaming source)
+  - Window: 4-hour tumbling (non-overlapping) per device+interface
+  - Detection: variance <= threshold (default 0.0)
+  - Output: Writes anomaly flags to ClickHouse in real-time
+  - State: Checkpoint stored in S3 for recovery
+
+Alternative Implementation (NOT YET INTEGRATED):
+  See src/models/flatline_detector.py which provides:
+  - FlatlineDetector class with Welford online variance algorithm
+  - O(1) streaming state per detector
+  - Pluggable AnomalyDetector interface for future use
+
+To run this job: python main.py --mode flatline-streaming
 """
 from __future__ import annotations
 
@@ -142,7 +158,7 @@ def run() -> None:
     )
 
     log.info(
-        "Legacy flatline streaming started (window=%s, watermark=%s, variance<=%s)",
+        "Flatline streaming started (window=%s, watermark=%s, variance<=%s)",
         WINDOW_DURATION,
         WATERMARK_DELAY,
         VARIANCE_THRESHOLD,

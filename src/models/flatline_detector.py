@@ -1,3 +1,29 @@
+"""Flatline Detection via Welford Online Variance Algorithm (ALTERNATIVE IMPLEMENTATION).
+
+This module provides a lightweight, streaming-friendly flatline detector using Welford's
+algorithm for online variance calculation. It's designed as a future drop-in replacement
+for the current Spark Structured Streaming approach in src/pipeline/flatline_streaming.py
+
+Current Status: NOT YET INTEGRATED into the main pipeline.
+
+When to Use This Over flatline_streaming.py:
+  - Processing micro-batches instead of 4-hour windows
+  - Lightweight per-record processing with minimal state
+  - Integrating with the pluggable AnomalyDetector interface
+  - Swapping variance calculation algorithms
+
+Trade-offs:
+  ✓ Lower memory footprint (O(1) state per detector)
+  ✓ Single-pass variance calculation
+  ✓ No distributed Spark needed for basic operation
+  ✗ Cannot partition across multiple workers
+  ✗ Needs explicit windowing logic (Welford just accumulates)
+
+Integration Path (future):
+  1. Refactor main streaming pipeline to collect micro-batches per device+interface
+  2. Feed batches to FlatlineDetector.detect() method
+  3. Emit AnomalyResult objects to ClickHouse writer
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -10,7 +36,12 @@ from transforms.flatline_v2 import detect_flatline
 
 
 class FlatlineDetector(AnomalyDetector):
-    """Streaming-friendly detector based on low variance over recent points."""
+    """Welford online variance detector for flatline anomalies.
+
+    Detects when a time series becomes flat (low variance) using Welford's
+    numerically-stable online variance algorithm. Requires a minimum number
+    of observations before making a detection.
+    """
 
     def __init__(
         self,
@@ -52,7 +83,11 @@ class FlatlineDetector(AnomalyDetector):
         return results
 
     def detect_from_dataframe(self, df: DataFrame, window_duration: str = "4 hours") -> DataFrame:
-        """Legacy compatibility helper for static DataFrame checks."""
+        """DataFrame method for batch processing (for testing/validation only).
+
+        NOTE: This uses Spark's F.variance(), not Welford. Use the detect() method
+        for actual Welford-based processing.
+        """
         return (
             df.filter(F.col("oper_status") == 1)
             .groupBy(
@@ -80,3 +115,29 @@ class FlatlineDetector(AnomalyDetector):
                 F.current_timestamp().alias("detected_at"),
             )
         )
+
+
+def detect_flatline_batch(records: list[dict], variance_threshold: float = 1e-12, min_points: int = 5) -> list[AnomalyResult]:
+    """Convenience function to detect flatlines in a batch of records using Welford algorithm.
+
+    Useful for integrating FlatlineDetector into a streaming pipeline's foreachBatch callback.
+
+    Example usage in streaming pipeline:
+        detector = FlatlineDetector(variance_threshold=1e-12, min_points=5)
+
+        def process_batch(batch_df: DataFrame, batch_id: int, ch: ClickHouseWriter) -> None:
+            records = batch_df.select("device_id", "interface_name", "effective_util_in", "oper_status").toPandas().to_dict(orient="records")
+            anomalies = detect_flatline_batch(records)
+            if anomalies:
+                ch.insert_anomalies(anomalies)
+
+    Args:
+        records: List of dictionaries with keys: device_id, interface_name, effective_util_in, oper_status
+        variance_threshold: Variance below this triggers flatline detection
+        min_points: Minimum samples required before making a detection
+
+    Returns:
+        List of AnomalyResult objects
+    """
+    detector = FlatlineDetector(variance_threshold=variance_threshold, min_points=min_points)
+    return detector.detect(records)

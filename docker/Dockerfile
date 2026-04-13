@@ -43,7 +43,6 @@ RUN uv sync --frozen --no-dev --extra core
 COPY src/ ./src/
 COPY data/ ./data/
 COPY scripts/ ./scripts/
-COPY tests/ ./tests/
 COPY sql/ ./sql/
 
 COPY main.py ./
