@@ -9,28 +9,28 @@
 
 ### Airflow — DAG overview
 http://localhost:8085       (admin/admin)
-![alt text](image-2.png)
+![alt text](image/image-2.png)
 
 ### Grafana — Health Dashboard
 http://localhost:3000       (admin/admin)
-![alt text](image-7.png)
+![alt text](image/image-7.png)
 
 ### Kafka UI
 http://localhost:8082
-![alt text](image-8.png)
+![alt text](image/image-8.png)
 
 ### Spark UI
 http://localhost:8080 (for batch jobs) or http://localhost:4040 (for streaming jobs)
 
-![alt text](image.png)
-![alt text](image-1.png)
+![alt text](iamge/image.png)
+![alt text](image/image-1.png)
 
 ### ClickHouse
-![alt text](image-3.png)
+![alt text](image/image-3.png)
 
 ### MinIO — Lakehouse Bucket
 http://localhost:9001 (minioadmin/ minioadmin123)
-![alt text](image-4.png)
+![alt text](image/image-4.png)
 
 ---
 
